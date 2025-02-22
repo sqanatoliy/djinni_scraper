@@ -1,26 +1,46 @@
-import scrapy
-from scrapy_playwright.page import PageMethod
 import os
+from collections import defaultdict
+from urllib.parse import urljoin as urllib_urljoin
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-LOGIN_SELECTOR = "ul > li:nth-child(1) > a.jobs-push-login-link"
-EMAIL_SELECTOR = "#email"
-PASSWORD_SELECTOR = "#password"
-LOGIN_BUTTON_SELECTOR = 'button.btn-primary[type="submit"]'
-PROFILE_SELECTOR = "div.navbar-collapse div.user-name"
+import scrapy
+from decouple import config
+
+from djinni_scraper.utils import get_start_url
+
+DJINNI_EMAIL = config("DJINNI_EMAIL")
+DJINNI_PASSWORD = config("DJINNI_PASSWORD")
+
+
+class DjinniSelectors:
+    LOGIN_SELECTOR = "ul > li:nth-child(1) > a.jobs-push-login-link"
+    EMAIL_SELECTOR = "#email"
+    PASSWORD_SELECTOR = "#password"
+    LOGIN_BUTTON_SELECTOR = 'button.btn-primary[type="submit"]'
+    PROFILE_SELECTOR = "div.navbar-collapse div.user-name"
+    JOBS_LIST_SELECTOR = "ul.list-jobs > li"
+    PAGINATION_ITEMS_SELECTOR = "ul.pagination_with_numbers li.page-item"
 
 
 class DjinniSpider(scrapy.Spider):
     name = "djinni"
     allowed_domains = ["djinni.co"]
-    start_urls = ["https://djinni.co/jobs/"]
-    login_url = "https://djinni.co/"
-    username = "your_email@gmail.com"
-    password = "your_password"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.params = {}
+        for key, value in kwargs.items():
+            if "," in value:
+                self.params[key] = value.split(",")
+            else:
+                self.params[key] = value
+
+        self.start_urls = [get_start_url(self.params)]
 
     def start_requests(self):
         """Перевіряємо, чи є збережений стан. Якщо є — використовуємо, інакше логінимось."""
         if os.path.exists("state.json"):
-            self.logger.info("✅ Знайдено state.json! Використовуємо збережену сесію.")
+            self.logger.info(f"✅ Знайдено state.json! Використовуємо збережену сесію. URL: {self.start_urls[0]}")
             yield scrapy.Request(
                 url=self.start_urls[0],
                 meta={
@@ -32,7 +52,7 @@ class DjinniSpider(scrapy.Spider):
         else:
             self.logger.info("🔄 Виконуємо авторизацію...")
             yield scrapy.Request(
-                url=self.login_url,
+                url="https://djinni.co/",
                 meta={
                     "playwright": True,
                     "playwright_context": "default",
@@ -47,50 +67,48 @@ class DjinniSpider(scrapy.Spider):
         await route.continue_()
 
     async def login(self, response):
-        """Процес авторизації"""
+        """Autologin to Djinni.co."""
         page = response.meta["playwright_page"]
 
         await page.route("**", self.log_request)
-        await page.wait_for_selector(LOGIN_SELECTOR)
-        await page.click(LOGIN_SELECTOR)
+        await page.wait_for_selector(DjinniSelectors.LOGIN_SELECTOR)
+        await page.click(DjinniSelectors.LOGIN_SELECTOR)
 
+        await page.wait_for_selector(DjinniSelectors.LOGIN_BUTTON_SELECTOR, timeout=10000)
         await page.wait_for_timeout(3000)
-        await page.fill(EMAIL_SELECTOR, self.username)
-        await page.fill(PASSWORD_SELECTOR, self.password)
-        storage_data = await page.evaluate("JSON.stringify(localStorage)")
-        print(f"🟢 LocalStorage: {storage_data}")
+        await page.fill(DjinniSelectors.EMAIL_SELECTOR, DJINNI_EMAIL)
+        await page.fill(DjinniSelectors.PASSWORD_SELECTOR, DJINNI_PASSWORD)
+        await page.click(DjinniSelectors.LOGIN_BUTTON_SELECTOR)
 
-        cookies = await page.context.cookies()
-        print(f"🟢 Cookies: {cookies}")
-        await page.click(LOGIN_BUTTON_SELECTOR)
-
-        await page.wait_for_selector(PROFILE_SELECTOR)
-
-        # Збереження сесії в файл
-        await page.context.storage_state(path="state.json")
-
+        try:
+            await page.wait_for_selector(DjinniSelectors.PROFILE_SELECTOR, timeout=10000)
+            self.logger.info("✅ Логін успішний! Зберігаємо state.json.")
+            await page.context.storage_state(path="state.json")
+        except PlaywrightTimeoutError as err:
+            self.logger.error(f"❌ Помилка логіну! {err} Видаляємо state.json.")
+            if os.path.exists("state.json"):
+                os.remove("state.json")
         await page.close()
-
-        # Тепер перевіряємо чи логін успішний
         yield scrapy.Request(
             url=self.start_urls[0],
             meta={"playwright": True, "playwright_context": "default"},
             callback=self.parse_jobs,
         )
 
-    async def parse_jobs(self, response):
+    def parse_jobs(self, response):
         """Парсимо вакансії після авторизації."""
-        jobs = response.css("ul.list-jobs > li")
+        jobs = response.css(DjinniSelectors.JOBS_LIST_SELECTOR)
         for job in jobs:
-            title = job.css("h2 > a::text").get(default="Not specified").strip(),
-            salary = job.css("h2 > strong > span::text").get(default="Not specified").strip(),
-            company = job.css("a.text-body.js-analytics-event::text").get(default="Not specified").strip(),
-            views = job.css("div > div:nth-child(2) > span:nth-child(2)::text").get(default="Not specified").strip(),
-            responses = job.css("div > div:nth-child(2) > span:nth-child(4)::text").get(default="Not specified").strip(),
-            pub_date = job.css("div > div:nth-child(2) > span:nth-child(6)::text").get(default="Not specified").strip(),
-            truncate_description = job.css("span.js-truncated-text::text").get(default="Not specified").strip(),
-            tags = job.css("h2 + div::text").getall(),
-            url = response.urljoin(job.css("h2 > a::attr(href)").get(default="Not specified")),
+            title = job.css("h2 > a::text").get(default="Not specified").strip()
+            salary = job.css("h2 > strong > span::text").get(default="Not specified").strip()
+            company = job.css("a.text-body.js-analytics-event::text").get(default="Not specified").strip()
+            views = job.css("div > div:nth-child(2) > span:nth-child(2)::text").get(default="Not specified").strip()
+            responses = job.css("div > div:nth-child(2) > span:nth-child(4)::text").get(default="Not specified").strip()
+            pub_date = job.css("div > div:nth-child(2) > span:nth-child(6)::attr(data-original-title)").get(default="Not specified").strip()
+            truncate_description = job.css("span.js-truncated-text::text").get(default="Not specified").strip()
+            raw_tags = job.css("h2 + div.fw-medium span::text").getall()
+            tags = [tag.strip() for tag in raw_tags if tag.strip() and '·' not in tag]
+            url = response.urljoin(job.css("h2 > a::attr(href)").get(default="Not specified"))
             yield {
                 "title": title,
                 "salary": salary,
@@ -102,9 +120,22 @@ class DjinniSpider(scrapy.Spider):
                 "tags": tags,
                 "url": url,
             }
+        yield from self.parse_pagination(response)
 
-        next_page = response.css("a.page-link.next::attr(href)").get()
-        if next_page:
-            yield response.follow(
-                next_page, callback=self.parse_jobs, meta={"playwright": True, "playwright_context": "default"}
-            )
+    def parse_pagination(self, response):
+        """Обробляє пагінацію та переходить на наступну сторінку."""
+        next_page_element = response.css("li.page-item.active + li.page-item a.page-link")
+
+        if next_page_element:
+            next_page_value = next_page_element.css("::text").get(default="").strip()
+            if next_page_value.isdigit():  # Переконуємося, що це число, а не ">"
+                next_page_link = next_page_element.css("::attr(href)").get()
+                if next_page_link:
+                    next_page_url = urllib_urljoin(response.url, next_page_link)
+                    self.logger.info(f"➡ Переходимо на сторінку {next_page_value}: {next_page_url}")
+                    yield scrapy.Request(
+                        url=next_page_url,
+                        callback=self.parse_jobs,
+                        dont_filter=True,
+                        meta={"playwright": True, "playwright_context": "default"}
+                    )

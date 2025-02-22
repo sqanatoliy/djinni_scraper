@@ -19,3 +19,8 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Auth state file
+/state.json
+/venv
+/jobs.json
