@@ -18,6 +18,8 @@
 - **Playwright** (для роботи з динамічним контентом)
 - **Docker** (опціонально, для зручного розгортання)
 - **SQLite / PostgreSQL** (для збереження даних)
+- **GitHub Actions** (для автоматизованого запуску скрапінгу)
+- **Telegram API** (для надсилання повідомлень у групу)
 
 ## 🚀 Встановлення та запуск
 
@@ -48,7 +50,7 @@ playwright install-deps  # для Linux
 ### 5️⃣ Запуск скрапінгу
     Фільтри можна задати через аргументи командного рядка.
     Наприклад, для пошуку вакансій Python розробника додаємо такі аргументи: -a primary_keyword=Python
-    Для пеоедачі множинних аргументів використовуємо кому.
+    Для передачі множинних аргументів використовуємо кому.
     Наприклад -a exp_level=no_exp,1y,2y,3y
     Для збереження результатів використовуємо ключ -o jobs.json
     Команда для пошуку вакансій Python розробника з досвідом 1-3 роки та рівнем англійської мови до intermediate включно:
@@ -60,30 +62,38 @@ scrapy crawl djinni -a primary_keyword=Python -a exp_level=no_exp,1y,2y,3y -a en
 ## 📁 Структура проєкту
 ```
 .
+.
 ├── djinni_scraper
-│   ├── __init__.py
-│   ├── items.py
-│   ├── middlewares.py
-│   ├── pipelines.py
-│   ├── settings.py
-│   ├── spiders
-│   │   ├── __init__.py
-│   │   └── djinni.py - Основний скрапер
-│   └── utils.py - Генерує стартовий URL з аргументів командного рядка
-├── jobs.json - Результати скрапінгу в форматі JSON
+│   ├── __init__.py
+│   ├── items.py
+│   ├── middlewares.py
+│   ├── pipelines.py
+│   ├── settings.py
+│   ├── spiders
+│   │   ├── __init__.py
+│   │   └── djinni.py
+│   └── utils
+│       ├── __init__.py
+│       ├── db_utls.py
+│       ├── telegram_utils.py
+│       └── url_utils.py
+├── jobs.json - збережені вакансії в форматі JSON
 ├── readme.md
 ├── requirements.txt
 ├── scrapy.cfg
-└── state.json - Зберігає авторизований стан скрапера
+├── state.json - авторизований стан Playwright
+├── .github/workflows/scraper.yml  # GitHub Actions для автоматичного запуску
+├── .env_template  # Файл із змінними середовища для налаштування Telegram, Djinni
+└── jobs.db  # Локальна база даних SQLite
 ```
 
-## 📌 Подальші плани
-✅ Отримання та збереження вакансій
-✅ Обхід CAPTCHA та авторизація (якщо буде потрібно)
-🔜 Збереження даних у БД
-🔜 Аналітика трендів
+## 🕒 Автоматизований запуск
+- Скрапер автоматично запускається **щогодини** через **GitHub Actions**.
+- Зібрані вакансії зберігаються у **SQLite** базу даних (`database.sqlite`).
+- Якщо налаштовані змінні середовища у `.env_template`, нові вакансії надсилаються у Telegram-групу.
 
 ---
 🔗 **Контакти**: Якщо маєте питання чи пропозиції, пишіть у Issues або Pull Requests!
 
 📝 **Ліцензія**: [MIT](./LICENSE)
+
