@@ -32,7 +32,7 @@ jobs:
 
     - name: Run Djinni scraper
       env:
-        DB_PATH: ./data/djinni_jobs.db
+        DB_PATH: ./jobs.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
