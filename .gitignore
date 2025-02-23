@@ -20,7 +20,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Auth state file
-/state.json
 /venv
 /jobs.json
