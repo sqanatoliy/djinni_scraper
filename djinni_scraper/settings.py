@@ -1,9 +1,16 @@
 import os
+import logging
+from logging.handlers import RotatingFileHandler
+from scrapy.utils.log import configure_logging
 
 BOT_NAME = "djinni_scraper"
 
 SPIDER_MODULES = ["djinni_scraper.spiders"]
 NEWSPIDER_MODULE = "djinni_scraper.spiders"
+
+# === Scrapy Performance Settings ===
+CONCURRENT_REQUESTS = 1
+DOWNLOAD_DELAY = 1
 
 USER_AGENT = None
 
@@ -52,3 +59,44 @@ ROBOTSTXT_OBEY = False
 # Set settings whose default value is deprecated to a future-proof value
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
+
+# === Logging Settings ===
+LOG_LEVEL = "INFO"
+
+# === Logging directory settings ===
+# LOGS_DIR = "logs"  # Directory for saving logs
+# LOGS_FILE = os.path.join(LOGS_DIR, "djinni_scraper.log")  # Full path to the log file
+# MAX_LOG_FILE_SIZE = 1 * 1024 * 1024 * 1024  # Maximum size of the log file (1 GB)
+# BACKUP_COUNT = 5  # Number of backup copies of logs
+#
+# # Ensure logs directory exists
+# os.makedirs(LOGS_DIR, exist_ok=True)
+
+# Configure Scrapy Logging
+configure_logging(install_root_handler=False)
+logger = logging.getLogger()
+
+# Remove existing FileHandlers to avoid duplicates
+logger.handlers = [
+    handler for handler in logger.handlers if not isinstance(handler, logging.FileHandler)
+]
+
+logger.setLevel(LOG_LEVEL)
+
+# # Rotating File Handler (Logs to file with rotation)
+# rotating_handler = RotatingFileHandler(
+#     LOGS_FILE, maxBytes=MAX_LOG_FILE_SIZE, backupCount=BACKUP_COUNT
+# )  # Creating a handler to rotate log files
+# formatter = logging.Formatter(
+#     "%(asctime)s [%(levelname)s] %(name)s [%(funcName)s]: %(message)s"
+# )
+# rotating_handler.setFormatter(formatter)
+# rotating_handler.setLevel(logging.INFO)  # Setting the logging level (if different from general)
+# logger.addHandler(rotating_handler)  # Adding a handler to the logger
+
+# Console Handler (Logs to terminal)
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s]: %(message)s"))
+    console_handler.setLevel(logging.INFO)
+    logger.addHandler(console_handler)
