@@ -1,0 +1,50 @@
+name: Run Djinni Scraper Hourly
+
+on:
+  schedule:
+    - cron: '15 * * * *'  # Запуск кожну годину
+  workflow_dispatch:  # Можливість ручного запуску
+
+jobs:
+  run_scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v3
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Install Playwright dependencies
+      run: |
+        playwright install chromium
+
+    - name: Wait before starting scraper (Cloudflare mitigation)
+      run: sleep 5
+
+    - name: Run Djinni scraper
+      env:
+        DB_PATH: ./data/djinni_jobs.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+      run: |
+        scrapy crawl djinni \
+          -a primary_keyword=Python \
+          -a exp_level=no_exp,1y,2y \
+          -a english_level=no_english,basic,pre,intermediate
+
+    - name: Commit and push database changes
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add ./data/djinni_jobs.db
+        git commit -m "Update Djinni job listings" || echo "No changes to commit"
+        git push

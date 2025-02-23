@@ -1,12 +1,11 @@
 import os
-from collections import defaultdict
 from urllib.parse import urljoin as urllib_urljoin
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import scrapy
 from decouple import config
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from djinni_scraper.utils import get_start_url
+from djinni_scraper.utils.url_utils import get_start_url
 
 DJINNI_EMAIL = config("DJINNI_EMAIL")
 DJINNI_PASSWORD = config("DJINNI_PASSWORD")
@@ -36,6 +35,7 @@ class DjinniSpider(scrapy.Spider):
                 self.params[key] = value
 
         self.start_urls = [get_start_url(self.params)]
+        self.category = self.params.get("primary_keyword", "all")
 
     def start_requests(self):
         """Перевіряємо, чи є збережений стан. Якщо є — використовуємо, інакше логінимось."""
@@ -119,6 +119,7 @@ class DjinniSpider(scrapy.Spider):
                 "truncate_description": truncate_description,
                 "tags": tags,
                 "url": url,
+                "category": self.category,
             }
         yield from self.parse_pagination(response)
 
@@ -128,7 +129,7 @@ class DjinniSpider(scrapy.Spider):
 
         if next_page_element:
             next_page_value = next_page_element.css("::text").get(default="").strip()
-            if next_page_value.isdigit():  # Переконуємося, що це число, а не ">"
+            if next_page_value.isdigit():
                 next_page_link = next_page_element.css("::attr(href)").get()
                 if next_page_link:
                     next_page_url = urllib_urljoin(response.url, next_page_link)

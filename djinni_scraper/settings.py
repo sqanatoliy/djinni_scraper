@@ -41,6 +41,10 @@ DOWNLOAD_HANDLERS = {
     "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
 }
 
+# === Pipelines ===
+ITEM_PIPELINES = {
+    'djinni_scraper.pipelines.SQLitePipeline': 300,
+}
 
 # Obey robots.txt rules
 ROBOTSTXT_OBEY = False
