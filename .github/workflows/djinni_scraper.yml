@@ -30,7 +30,7 @@ jobs:
     - name: Wait before starting scraper (Cloudflare mitigation)
       run: sleep 5
 
-    - name: Run Djinni scraper
+    - name: Run Djinni scraper for Python jobs
       env:
         DB_PATH: ./jobs.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
@@ -41,6 +41,44 @@ jobs:
         scrapy crawl djinni \
           -a primary_keyword=Python \
           -a exp_level=no_exp,1y,2y \
+          -a english_level=no_english,basic,pre,intermediate
+
+    - name: Run Djinni scraper for no experience jobs
+      env:
+        DB_PATH: ./jobs.db
+        DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
+        DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
+        TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        scrapy crawl djinni \
+          -a exp_level=no_exp \
+          -a english_level=no_english,basic,pre,intermediate
+
+    - name: Run Djinni scraper for other category jobs
+      env:
+        DB_PATH: ./jobs.db
+        DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
+        DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
+        TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        scrapy crawl djinni \
+          -a primary_keyword=Other \
+          -a exp_level=no_exp,1y \
+          -a english_level=no_english,basic,pre,intermediate
+
+    - name: Run Djinni scraper for Support jobs
+      env:
+        DB_PATH: ./jobs.db
+        DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
+        DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
+        TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        scrapy crawl djinni \
+          -a primary_keyword=Support \
+          -a exp_level=no_exp,1y \
           -a english_level=no_english,basic,pre,intermediate
 
     - name: Commit and push database changes
