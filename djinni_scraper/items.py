@@ -7,6 +7,13 @@ import scrapy
 
 
 class DjinniScraperItem(scrapy.Item):
-    # define the fields for your item here like:
-    # name = scrapy.Field()
-    pass
+    title = scrapy.Field()
+    salary = scrapy.Field()
+    company = scrapy.Field()
+    views = scrapy.Field()
+    responses = scrapy.Field()
+    pub_date = scrapy.Field()
+    truncate_description = scrapy.Field()
+    tags = scrapy.Field()
+    url = scrapy.Field()
+    category = scrapy.Field()

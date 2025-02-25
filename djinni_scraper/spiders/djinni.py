@@ -6,6 +6,7 @@ from decouple import config
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from djinni_scraper.utils.url_utils import get_start_url
+from ..items import DjinniScraperItem
 
 DJINNI_EMAIL = config("DJINNI_EMAIL")
 DJINNI_PASSWORD = config("DJINNI_PASSWORD")
@@ -109,18 +110,20 @@ class DjinniSpider(scrapy.Spider):
             raw_tags = job.css("h2 + div.fw-medium span::text").getall()
             tags = [tag.strip() for tag in raw_tags if tag.strip() and '·' not in tag]
             url = response.urljoin(job.css("h2 > a::attr(href)").get(default="Not specified"))
-            yield {
-                "title": title,
-                "salary": salary,
-                "company": company,
-                "views": views,
-                "responses": responses,
-                "pub_date": pub_date,
-                "truncate_description": truncate_description,
-                "tags": tags,
-                "url": url,
-                "category": self.category,
-            }
+            item: DjinniScraperItem = DjinniScraperItem()
+            item.update(
+                title=title,
+                salary=salary,
+                company=company,
+                views=views,
+                responses=responses,
+                pub_date=pub_date,
+                truncate_description=truncate_description,
+                tags=tags,
+                url=url,
+                category=self.category,
+            )
+            yield item
         yield from self.parse_pagination(response)
 
     def parse_pagination(self, response):
