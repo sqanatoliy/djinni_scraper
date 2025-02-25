@@ -134,9 +134,9 @@ class DjinniSpider(scrapy.Spider):
                 if next_page_link:
                     next_page_url = urllib_urljoin(response.url, next_page_link)
                     self.logger.info(f"➡ Переходимо на сторінку {next_page_value}: {next_page_url}")
-                    yield scrapy.Request(
-                        url=next_page_url,
+                    yield response.follow(
+                        next_page_url,
                         callback=self.parse_jobs,
-                        dont_filter=True,
-                        meta={"playwright": True, "playwright_context": "default"}
+                        meta={"playwright": True, "playwright_context": "default"},
+                        dont_filter=True
                     )
