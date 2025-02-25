@@ -52,7 +52,7 @@ jobs:
         CHAT_ID: ${{ secrets.CHAT_ID }}
       run: |
         scrapy crawl djinni \
-          -a primary_keyword=Data \
+          -a primary_keyword=Data Engineer \
           -a exp_level=no_exp,1y \
           -a english_level=no_english,basic,pre,intermediate
 
