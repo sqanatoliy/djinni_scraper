@@ -32,6 +32,12 @@ PLAYWRIGHT_CONTEXTS = {
         "viewport": {"width": 1920, "height": 1080},
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "java_script_enabled": True,
+        "ignore_https_errors": True,
+        # "proxy": {
+        #     "server": "http://myproxy.com:3128",
+        #     "username": "user",
+        #     "password": "pass",
+        # },
         "extra_http_headers": {
             "Accept-Language": "en-US,en;q=0.9,uk-UA;q=0.8,uk;q=0.7",
             "Referer": "https://djinni.co/",

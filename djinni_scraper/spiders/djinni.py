@@ -99,6 +99,7 @@ class DjinniSpider(scrapy.Spider):
     def parse_jobs(self, response):
         """Парсимо вакансії після авторизації."""
         jobs = response.css(DjinniSelectors.JOBS_LIST_SELECTOR)
+        item: DjinniScraperItem = DjinniScraperItem()
         for job in jobs:
             title = job.css("h2 > a::text").get(default="Not specified").strip()
             salary = job.css("h2 > strong > span::text").get(default="Not specified").strip()
@@ -110,7 +111,6 @@ class DjinniSpider(scrapy.Spider):
             raw_tags = job.css("h2 + div.fw-medium span::text").getall()
             tags = [tag.strip() for tag in raw_tags if tag.strip() and '·' not in tag]
             url = response.urljoin(job.css("h2 > a::attr(href)").get(default="Not specified"))
-            item: DjinniScraperItem = DjinniScraperItem()
             item.update(
                 title=title,
                 salary=salary,
