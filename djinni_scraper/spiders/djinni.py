@@ -3,6 +3,7 @@ from urllib.parse import urljoin as urllib_urljoin
 
 import scrapy
 from decouple import config
+from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from djinni_scraper.utils.url_utils import get_start_url
@@ -44,22 +45,25 @@ class DjinniSpider(scrapy.Spider):
             self.logger.info(f"✅ Знайдено state.json! Використовуємо збережену сесію. URL: {self.start_urls[0]}")
             yield scrapy.Request(
                 url=self.start_urls[0],
-                meta={
-                    "playwright": True,
-                    "playwright_context": "default",
-                },
                 callback=self.parse_jobs,
-            )
-        else:
-            self.logger.info("🔄 Виконуємо авторизацію...")
-            yield scrapy.Request(
-                url="https://djinni.co/",
                 meta={
                     "playwright": True,
                     "playwright_context": "default",
                     "playwright_include_page": True,
                 },
+                errback=self.errback_close_page,
+            )
+        else:
+            self.logger.info("🔄 Виконуємо авторизацію...")
+            yield scrapy.Request(
+                url="https://djinni.co/",
                 callback=self.login,
+                meta={
+                    "playwright": True,
+                    "playwright_context": "default",
+                    "playwright_include_page": True,
+                },
+                errback=self.errback_close_page,
             )
 
     @staticmethod
@@ -89,15 +93,32 @@ class DjinniSpider(scrapy.Spider):
             self.logger.error(f"❌ Помилка логіну! {err} Видаляємо state.json.")
             if os.path.exists("state.json"):
                 os.remove("state.json")
-        await page.close()
+        finally:
+            await page.close()
         yield scrapy.Request(
             url=self.start_urls[0],
-            meta={"playwright": True, "playwright_context": "default"},
             callback=self.parse_jobs,
+            meta={
+                "playwright": True,
+                "playwright_context": "default",
+                "playwright_include_page": True,
+            },
+            errback=self.errback_close_page,
         )
 
-    def parse_jobs(self, response):
+    async def parse_jobs(self, response):
         """Парсимо вакансії після авторизації."""
+        page = response.meta["playwright_page"]
+        if not page:
+            self.logger.error("❌ Не отримано Playwright page. Завантажуємо без нього.")
+            return
+        try:
+            await page.wait_for_selector(DjinniSelectors.PROFILE_SELECTOR, timeout=5000)
+            self.logger.info("✅ Авторизація активна.")
+        except PlaywrightTimeoutError:
+            self.logger.warning("❌ Авторизація не знайдена. Видаляємо state.json.")
+            os.remove("state.json")
+
         jobs = response.css(DjinniSelectors.JOBS_LIST_SELECTOR)
         item: DjinniScraperItem = DjinniScraperItem()
         for job in jobs:
@@ -124,9 +145,10 @@ class DjinniSpider(scrapy.Spider):
                 category=self.category,
             )
             yield item
-        yield from self.parse_pagination(response)
+        async for next_page_request in self.parse_pagination(response):
+            yield next_page_request
 
-    def parse_pagination(self, response):
+    async def parse_pagination(self, response):
         """Обробляє пагінацію та переходить на наступну сторінку."""
         next_page_element = response.css("li.page-item.active + li.page-item a.page-link")
 
@@ -137,9 +159,19 @@ class DjinniSpider(scrapy.Spider):
                 if next_page_link:
                     next_page_url = urllib_urljoin(response.url, next_page_link)
                     self.logger.info(f"➡ Переходимо на сторінку {next_page_value}: {next_page_url}")
-                    yield response.follow(
+                    yield scrapy.Request(
                         next_page_url,
                         callback=self.parse_jobs,
                         meta={"playwright": True, "playwright_context": "default"},
                         dont_filter=True
+
                     )
+
+    async def errback_close_page(self, failure):
+        """Закриває Playwright сторінку у випадку помилки."""
+        page: Page = failure.request.meta.get("playwright_page")
+        if page:
+            await page.close()
+            self.logger.warning("❌ Сторінка Playwright закрита через помилку.")
+        else:
+            self.logger.error("🚨 Помилка: не вдалося отримати `playwright_page` у `errback`.")
