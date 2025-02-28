@@ -18,7 +18,7 @@ USER_AGENT = None
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
 PLAYWRIGHT_LAUNCH_OPTIONS = {
     # "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "headless": True,
+    "headless": False,
     "args": [
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu",
@@ -27,6 +27,7 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
     ],
 }
 PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 30_000
+PLAYWRIGHT_MAX_CONTEXTS = 3
 PLAYWRIGHT_CONTEXTS = {
     "default": {
         "viewport": {"width": 1920, "height": 1080},
@@ -67,16 +68,17 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
 # === Logging Settings ===
-LOG_LEVEL = "INFO"
 
+# === Logging Settings ===
+LOG_LEVEL = "INFO"
 # === Logging directory settings ===
-# LOGS_DIR = "logs"  # Directory for saving logs
-# LOGS_FILE = os.path.join(LOGS_DIR, "djinni_scraper.log")  # Full path to the log file
-# MAX_LOG_FILE_SIZE = 1 * 1024 * 1024 * 1024  # Maximum size of the log file (1 GB)
-# BACKUP_COUNT = 5  # Number of backup copies of logs
-#
-# # Ensure logs directory exists
-# os.makedirs(LOGS_DIR, exist_ok=True)
+LOGS_DIR = "logs"  # Directory for saving logs
+LOGS_FILE = os.path.join(LOGS_DIR, "djinni_scraper.log")  # Full path to the log file
+MAX_LOG_FILE_SIZE = 1 * 1024 * 1024 * 1024  # Maximum size of the log file (1 GB)
+BACKUP_COUNT = 5  # Number of backup copies of logs
+
+# Ensure logs directory exists
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 # Configure Scrapy Logging
 configure_logging(install_root_handler=False)
@@ -89,16 +91,16 @@ logger.handlers = [
 
 logger.setLevel(LOG_LEVEL)
 
-# # Rotating File Handler (Logs to file with rotation)
-# rotating_handler = RotatingFileHandler(
-#     LOGS_FILE, maxBytes=MAX_LOG_FILE_SIZE, backupCount=BACKUP_COUNT
-# )  # Creating a handler to rotate log files
-# formatter = logging.Formatter(
-#     "%(asctime)s [%(levelname)s] %(name)s [%(funcName)s]: %(message)s"
-# )
-# rotating_handler.setFormatter(formatter)
-# rotating_handler.setLevel(logging.INFO)  # Setting the logging level (if different from general)
-# logger.addHandler(rotating_handler)  # Adding a handler to the logger
+# Rotating File Handler (Logs to file with rotation)
+rotating_handler = RotatingFileHandler(
+    LOGS_FILE, maxBytes=MAX_LOG_FILE_SIZE, backupCount=BACKUP_COUNT
+)  # Creating a handler to rotate log files
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s [%(funcName)s]: %(message)s"
+)
+rotating_handler.setFormatter(formatter)
+rotating_handler.setLevel(logging.INFO)  # Setting the logging level (if different from general)
+logger.addHandler(rotating_handler)  # Adding a handler to the logger
 
 # Console Handler (Logs to terminal)
 if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
