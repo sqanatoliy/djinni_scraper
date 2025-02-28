@@ -1,3 +1,5 @@
+from scrapy import signals
+from twisted.internet.defer import inlineCallbacks
 import os
 from urllib.parse import urljoin as urllib_urljoin
 
@@ -38,6 +40,22 @@ class DjinniSpider(scrapy.Spider):
 
         self.start_urls = [get_start_url(self.params)]
         self.category = self.params.get("primary_keyword", "all")
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        """Реєструємо `open_spider, close_spider`"""
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider.open_spider, signal=signals.spider_opened)
+        crawler.signals.connect(spider.close_spider, signal=signals.spider_closed)
+        return spider
+
+    def open_spider(self, spider):
+        """Відкриваємо Spider"""
+        spider.logger.info("✅Spider opened: %s", spider.name)
+
+    def close_spider(self, spider):
+        """Закриваємо Spider"""
+        spider.logger.info("✅Spider closed: %s", spider.name)
 
     def start_requests(self):
         """Перевіряємо, чи є збережений стан. Якщо є — використовуємо, інакше логінимось."""
