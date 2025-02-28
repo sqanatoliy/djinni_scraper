@@ -145,6 +145,8 @@ class DjinniSpider(scrapy.Spider):
                 category=self.category,
             )
             yield item
+        self.logger.info("🛑 Закриваємо сторінку Playwright перед переходом на наступну.")
+        await page.close()
         async for next_page_request in self.parse_pagination(response):
             yield next_page_request
 
@@ -152,20 +154,30 @@ class DjinniSpider(scrapy.Spider):
         """Обробляє пагінацію та переходить на наступну сторінку."""
         next_page_element = response.css("li.page-item.active + li.page-item a.page-link")
 
-        if next_page_element:
-            next_page_value = next_page_element.css("::text").get(default="").strip()
-            if next_page_value.isdigit():
-                next_page_link = next_page_element.css("::attr(href)").get()
-                if next_page_link:
-                    next_page_url = urllib_urljoin(response.url, next_page_link)
-                    self.logger.info(f"➡ Переходимо на сторінку {next_page_value}: {next_page_url}")
-                    yield scrapy.Request(
-                        next_page_url,
-                        callback=self.parse_jobs,
-                        meta={"playwright": True, "playwright_context": "default"},
-                        dont_filter=True
+        if not next_page_element:
+            self.logger.info("🛑 Наступної сторінки немає. Завершуємо парсинг.")
+            return
 
-                    )
+        next_page_value = next_page_element.css("::text").get(default="").strip()
+        next_page_link = next_page_element.css("::attr(href)").get()
+
+        if next_page_value.isdigit() and next_page_link:
+            next_page_url = urllib_urljoin(response.url, next_page_link)
+            self.logger.info(f"➡ Переходимо на сторінку {next_page_value}: {next_page_url}")
+
+            yield scrapy.Request(
+                next_page_url,
+                callback=self.parse_jobs,
+                meta={
+                    "playwright": True,
+                    "playwright_context": "default",
+                    "playwright_include_page": True,
+                },
+                dont_filter=True,  # ✅ Дозволяє Scrapy робити повторні запити
+                errback=self.errback_close_page,
+            )
+        else:
+            self.logger.warning("🚨 `parse_pagination()` не знайшла наступної сторінки!")
 
     async def errback_close_page(self, failure):
         """Закриває Playwright сторінку у випадку помилки."""
