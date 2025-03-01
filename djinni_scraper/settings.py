@@ -18,7 +18,7 @@ USER_AGENT = None
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
 PLAYWRIGHT_LAUNCH_OPTIONS = {
     # "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "headless": False,
+    "headless": True,
     "args": [
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu",
