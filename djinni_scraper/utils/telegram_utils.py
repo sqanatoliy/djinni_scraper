@@ -6,9 +6,6 @@ from typing import Any, Dict
 import requests
 from decouple import config
 
-# Telegram API
-TELEGRAM_TOKEN = config("TELEGRAM_TOKEN")
-CHAT_ID = config("CHAT_ID")
 
 
 class Telegram:
@@ -17,6 +14,8 @@ class Telegram:
 
     def __init__(self, spider: Any) -> None:
         self.spider = spider
+        self.token = config("TELEGRAM_TOKEN")
+        self.chat_id = config("CHAT_ID")
 
     @staticmethod
     def _clean_text_for_telegram(text: str) -> str:
@@ -50,7 +49,7 @@ class Telegram:
         """Sends a job offer to a Telegram chat."""
         msg: str = self._create_telegram_message(data)
         payload: Dict[str, Any] = {
-            "chat_id": CHAT_ID,
+            "chat_id": self.chat_id,
             "text": msg,
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
@@ -59,7 +58,7 @@ class Telegram:
         while True:
             try:
                 response: requests.Response = requests.post(
-                    self.TELEGRAM_API_URL.format(TELEGRAM_TOKEN),
+                    self.TELEGRAM_API_URL.format(self.token),
                     data=payload,
                     timeout=60,
                 )
