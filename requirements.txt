@@ -3,3 +3,7 @@ Scrapy==2.12.0
 scrapy-playwright==0.0.42
 python-decouple==3.8
 requests==2.32.3
+
+pytest==8.3.5
+Twisted~=24.11.0
+itemadapter~=0.11.0
