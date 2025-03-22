@@ -14,8 +14,8 @@ class Telegram:
 
     def __init__(self, spider: Any) -> None:
         self.spider = spider
-        self.token = config("TELEGRAM_TOKEN")
-        self.chat_id = config("CHAT_ID")
+        self.token = config("TELEGRAM_TOKEN", default="dummy_token")
+        self.chat_id = config("CHAT_ID", default="dummy_chat_id")
 
     @staticmethod
     def _clean_text_for_telegram(text: str) -> str:
