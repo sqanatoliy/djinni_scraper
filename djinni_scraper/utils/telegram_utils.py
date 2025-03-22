@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from typing import Any, Dict
 
@@ -20,7 +21,10 @@ class Telegram:
     @staticmethod
     def _clean_text_for_telegram(text: str) -> str:
         """Cleans text for Telegram compatibility."""
-        return text.replace("`", "'").replace("’", "'").strip()
+        text = text.replace("`", "'").replace("’", "'").strip()
+        # Escape Markdown symbols
+        escape_chars = r'_*[]()~`>#+-=|{}.!'
+        return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
     def _create_telegram_message(self, data: dict) -> str:
         """Creates a formatted message for Telegram."""
