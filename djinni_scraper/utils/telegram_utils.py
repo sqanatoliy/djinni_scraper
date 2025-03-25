@@ -51,7 +51,7 @@ class Telegram:
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": msg,
-            "parse_mode": "Markdown",
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": True,
         }
 
