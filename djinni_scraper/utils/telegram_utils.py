@@ -19,10 +19,10 @@ class Telegram:
 
     @staticmethod
     def _clean_text_for_telegram(text: str) -> str:
-        """Cleans text for Telegram compatibility."""
+        """Escape text for Telegram MarkdownV2."""
         text = text.replace("`", "'").replace("’", "'").strip()
-        # Escape Markdown symbols
-        escape_chars = r'_*[]()~`>#+-=|{}.!'
+        # Telegram MarkdownV2 requires escaping all of the following characters:
+        escape_chars = r'_*[]()~`>#+-=|{}.!\\'
         return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
     def _create_telegram_message(self, data: dict) -> str:
@@ -34,15 +34,16 @@ class Telegram:
             tags_text = ", ".join(tags_list) if tags_list else "No tags"
         except json.JSONDecodeError:
             tags_text = raw_tags  # Якщо раптом це вже звичайний текст
+        clean = self._clean_text_for_telegram
         return (
-            f"DJINNI.CO in category {data['category']} \n"
-            f"*Date:* {data['pub_date']}\n"
-            f"[{data['title']}]({data['url']}) at *{data['company']}*\n"
-            f"*Views:* {data['views']}\n"
-            f"*Responses:* {data['responses']}\n"
-            f"*Salary:* {data['salary'] or 'N/A'}\n"
-            f"*Tags:* {tags_text}\n"
-            f"*Desc:* {self._clean_text_for_telegram(data['truncate_description'] or 'N/A')}"
+            f"{clean('DJINNI.CO in category')} {clean(data['category'])}\n"
+            f"*{clean('Date:')}* {clean(data['pub_date'])}\n"
+            f"[{clean(data['title'])}]({clean(data['url'])}) {clean('at')} *{clean(data['company'])}*\n"
+            f"*{clean('Views:')}* {clean(str(data['views']))}\n"
+            f"*{clean('Responses:')}* {clean(str(data['responses']))}\n"
+            f"*{clean('Salary:')}* {clean(data['salary'] or 'N/A')}\n"
+            f"*{clean('Tags:')}* {clean(tags_text)}\n"
+            f"*{clean('Desc:')}* {clean(data['truncate_description'] or 'N/A')}"
         )
 
     def send_job_to_telegram(self, data: dict) -> None:
