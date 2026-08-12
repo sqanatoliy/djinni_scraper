@@ -1,25 +1,28 @@
 import os
-from urllib.parse import urljoin as urllib_urljoin
+from urllib.parse import urljoin as urllib_urljoin, urlparse
 
 import scrapy
 from decouple import config
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapy import signals
+from scrapy.exceptions import CloseSpider
 
-from djinni_scraper.utils.url_utils import get_start_url
+from djinni_scraper.utils.url_utils import BASE_URL, get_start_url
 from ..items import DjinniScraperItem
 
-DJINNI_EMAIL = config("DJINNI_EMAIL")
-DJINNI_PASSWORD = config("DJINNI_PASSWORD")
+STATE_FILE = "state.json"
+LOGIN_URL = urllib_urljoin(BASE_URL, "/login?lang=uk&from=jobs&next=/jobs/")
+LOGIN_TIMEOUT_MS = 10_000
 
 
 class DjinniSelectors:
-    LOGIN_SELECTOR = "ul > li:nth-child(1) > a.jobs-push-login-link"
+    LOGIN_FORM_SELECTOR = "form#signup"
     EMAIL_SELECTOR = "#email"
     PASSWORD_SELECTOR = "#password"
-    LOGIN_BUTTON_SELECTOR = 'button.btn-primary[type="submit"]'
-    PROFILE_SELECTOR = "div.navbar-collapse div.user-name"
+    LOGIN_BUTTON_SELECTOR = 'form#signup button[type="submit"]:not([name])'
+    AUTHENTICATED_MARKER_SELECTOR = 'a[href^="/logout"]'
     JOBS_LIST_SELECTOR = ".list-jobs .job-item"
     JOB_LINK_SELECTOR = ".job_item__header-link"
     JOB_TITLE_SELECTOR = ".job_item__header-link .job-item__position"
@@ -64,91 +67,157 @@ class DjinniSpider(scrapy.Spider):
         spider.logger.info("✅Spider closed: %s", spider.name)
 
     def start_requests(self):
-        """Перевіряємо, чи є збережений стан. Якщо є — використовуємо, інакше логінимось."""
-        if os.path.exists("state.json"):
+        """Reuses a local session or starts one explicit login attempt."""
+        if self._storage_state_exists():
             self.logger.info(f"✅ Знайдено state.json! Використовуємо збережену сесію. URL: {self.start_urls[0]}")
-            yield scrapy.Request(
-                url=self.start_urls[0],
-                callback=self.parse_jobs,
-                meta={
-                    "playwright": True,
-                    "playwright_context": "default",
-                    "playwright_include_page": True,
-                },
-                errback=self.errback_close_page,
-            )
+            yield self._jobs_request(self.start_urls[0])
         else:
             self.logger.info("🔄 Виконуємо авторизацію...")
-            yield scrapy.Request(
-                url="https://djinni.co/",
-                callback=self.login,
-                meta={
-                    "playwright": True,
-                    "playwright_context": "default",
-                    "playwright_include_page": True,
-                },
-                errback=self.errback_close_page,
-            )
-
-    @staticmethod
-    async def log_request(route, request):
-        print(f"📡 Запит: {request.url} | Метод: {request.method}")
-        await route.continue_()
+            yield self._login_request(self.start_urls[0], auth_recovery_attempted=False)
 
     async def login(self, response):
-        """Autologin to Djinni.co."""
-        page = response.meta["playwright_page"]
+        """Logs in and resumes the one jobs URL that initiated this auth flow."""
+        page = response.meta.get("playwright_page")
+        target_url = response.meta.get("auth_target_url", self.start_urls[0])
+        try:
+            if not page:
+                raise CloseSpider("Djinni login did not receive a Playwright page")
 
-        await page.route("**", self.log_request)
-        await page.wait_for_selector(DjinniSelectors.LOGIN_SELECTOR)
-        await page.click(DjinniSelectors.LOGIN_SELECTOR)
+            email, password = self._get_credentials()
+            await page.wait_for_selector(DjinniSelectors.LOGIN_FORM_SELECTOR, timeout=LOGIN_TIMEOUT_MS)
+            await page.fill(DjinniSelectors.EMAIL_SELECTOR, email)
+            await page.fill(DjinniSelectors.PASSWORD_SELECTOR, password)
+            await page.click(DjinniSelectors.LOGIN_BUTTON_SELECTOR)
 
-        await page.wait_for_selector(DjinniSelectors.LOGIN_BUTTON_SELECTOR, timeout=10000)
-        await page.wait_for_timeout(3000)
-        await page.fill(DjinniSelectors.EMAIL_SELECTOR, DJINNI_EMAIL)
-        await page.fill(DjinniSelectors.PASSWORD_SELECTOR, DJINNI_PASSWORD)
-        await page.click(DjinniSelectors.LOGIN_BUTTON_SELECTOR)
+            if not await self._wait_for_authenticated(page):
+                self._discard_storage_state()
+                raise CloseSpider("Djinni login was rejected or remained anonymous")
+
+            try:
+                await page.context.storage_state(path=STATE_FILE)
+            except PlaywrightError:
+                self.logger.exception("Failed to save confirmed Djinni Playwright storage state.")
+                raise
+
+            self.logger.info("✅ Djinni login succeeded; local storage state saved.")
+            yield self._jobs_request(
+                target_url,
+                auth_recovery_attempted=response.meta.get("auth_recovery_attempted", False),
+            )
+        except PlaywrightTimeoutError as error:
+            self._discard_storage_state()
+            self.logger.error("Djinni login form or authenticated marker was not available before timeout.")
+            raise CloseSpider("Djinni login timed out or remained anonymous") from error
+        except PlaywrightError as error:
+            self._discard_storage_state()
+            self.logger.error("Djinni Playwright error during login: %s", error)
+            raise CloseSpider("Djinni login failed due to a Playwright error") from error
+        finally:
+            await self._close_page(page)
+
+    async def parse_jobs(self, response):
+        """Парсимо вакансії після авторизації."""
+        page = response.meta.get("playwright_page")
+        if not page:
+            raise CloseSpider("Djinni jobs request did not receive a Playwright page")
 
         try:
-            await page.wait_for_selector(DjinniSelectors.PROFILE_SELECTOR, timeout=10000)
-            self.logger.info("✅ Логін успішний! Зберігаємо state.json.")
-            await page.context.storage_state(path="state.json")
-        except PlaywrightTimeoutError as err:
-            self.logger.error(f"❌ Помилка логіну! {err} Видаляємо state.json.")
-            if os.path.exists("state.json"):
-                os.remove("state.json")
+            if not await self._is_authenticated(page):
+                self._discard_storage_state()
+                if response.meta.get("auth_recovery_attempted", False):
+                    raise CloseSpider("Djinni authentication recovery failed; anonymous jobs page was not parsed")
+
+                target_url = response.meta.get("auth_target_url", response.url)
+                self.logger.warning("Djinni session is invalid; starting one login recovery attempt.")
+                yield self._login_request(target_url, auth_recovery_attempted=True)
+                return
+
+            self.logger.info("✅ Авторизація активна.")
+            for job in response.css(DjinniSelectors.JOBS_LIST_SELECTOR):
+                yield self._parse_job_card(job, response)
+            async for next_page_request in self.parse_pagination(response):
+                yield next_page_request
         finally:
-            await page.close()
-        yield scrapy.Request(
-            url=self.start_urls[0],
+            await self._close_page(page)
+
+    def _jobs_request(self, url, auth_recovery_attempted=False):
+        return scrapy.Request(
+            url=url,
             callback=self.parse_jobs,
             meta={
                 "playwright": True,
                 "playwright_context": "default",
                 "playwright_include_page": True,
+                "auth_target_url": url,
+                "auth_recovery_attempted": auth_recovery_attempted,
             },
             errback=self.errback_close_page,
         )
 
-    async def parse_jobs(self, response):
-        """Парсимо вакансії після авторизації."""
-        page = response.meta["playwright_page"]
-        if not page:
-            self.logger.error("❌ Не отримано Playwright page. Завантажуємо без нього.")
-            return
-        try:
-            await page.wait_for_selector(DjinniSelectors.PROFILE_SELECTOR, timeout=5000)
-            self.logger.info("✅ Авторизація активна.")
-        except PlaywrightTimeoutError:
-            self.logger.warning("❌ Авторизація не знайдена. Видаляємо state.json.")
-            os.remove("state.json")
+    def _login_request(self, target_url, auth_recovery_attempted):
+        self._get_credentials()
+        return scrapy.Request(
+            url=LOGIN_URL,
+            callback=self.login,
+            meta={
+                "playwright": True,
+                "playwright_context": "default",
+                "playwright_include_page": True,
+                "auth_target_url": target_url,
+                "auth_recovery_attempted": auth_recovery_attempted,
+            },
+            errback=self.errback_close_page,
+            dont_filter=True,
+        )
 
-        for job in response.css(DjinniSelectors.JOBS_LIST_SELECTOR):
-            yield self._parse_job_card(job, response)
-        self.logger.info("🛑 Закриваємо сторінку Playwright перед переходом на наступну.")
-        await page.close()
-        async for next_page_request in self.parse_pagination(response):
-            yield next_page_request
+    @staticmethod
+    def _storage_state_exists():
+        return os.path.exists(STATE_FILE)
+
+    def _discard_storage_state(self):
+        if self._storage_state_exists():
+            os.remove(STATE_FILE)
+            self.logger.info("Removed stale local Djinni Playwright storage state.")
+
+    @staticmethod
+    def _get_credentials():
+        credentials = {
+            "DJINNI_EMAIL": config("DJINNI_EMAIL", default="").strip(),
+            "DJINNI_PASSWORD": config("DJINNI_PASSWORD", default="").strip(),
+        }
+        missing = [name for name, value in credentials.items() if not value]
+        if missing:
+            raise CloseSpider(f"Missing required Djinni configuration: {', '.join(missing)}")
+        return credentials["DJINNI_EMAIL"], credentials["DJINNI_PASSWORD"]
+
+    async def _wait_for_authenticated(self, page):
+        try:
+            await page.wait_for_selector(
+                DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR,
+                timeout=LOGIN_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            return False
+        return await self._is_authenticated(page)
+
+    @staticmethod
+    async def _is_authenticated(page):
+        current_path = urlparse(page.url).path.rstrip("/")
+        if current_path == "/login":
+            return False
+
+        login_form_count = await page.locator(DjinniSelectors.LOGIN_FORM_SELECTOR).count()
+        authenticated_marker_count = await page.locator(
+            DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR
+        ).count()
+        return login_form_count == 0 and authenticated_marker_count > 0
+
+    async def _close_page(self, page):
+        if page:
+            try:
+                await page.close()
+            except PlaywrightError as error:
+                self.logger.warning("Unable to close Djinni Playwright page cleanly: %s", error)
 
     def _parse_job_card(self, job, response) -> DjinniScraperItem:
         """Extracts the current public Djinni listing-card fields."""
@@ -199,6 +268,8 @@ class DjinniSpider(scrapy.Spider):
                     "playwright": True,
                     "playwright_context": "default",
                     "playwright_include_page": True,
+                    "auth_target_url": next_page_url,
+                    "auth_recovery_attempted": False,
                 },
                 dont_filter=True,  # ✅ Дозволяє Scrapy робити повторні запити
                 errback=self.errback_close_page,
