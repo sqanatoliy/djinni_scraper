@@ -1,5 +1,3 @@
-from scrapy import signals
-from twisted.internet.defer import inlineCallbacks
 import os
 from urllib.parse import urljoin as urllib_urljoin
 
@@ -7,6 +5,7 @@ import scrapy
 from decouple import config
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from scrapy import signals
 
 from djinni_scraper.utils.url_utils import get_start_url
 from ..items import DjinniScraperItem
@@ -21,7 +20,14 @@ class DjinniSelectors:
     PASSWORD_SELECTOR = "#password"
     LOGIN_BUTTON_SELECTOR = 'button.btn-primary[type="submit"]'
     PROFILE_SELECTOR = "div.navbar-collapse div.user-name"
-    JOBS_LIST_SELECTOR = "ul.list-jobs > li"
+    JOBS_LIST_SELECTOR = ".list-jobs .job-item"
+    JOB_LINK_SELECTOR = ".job_item__header-link"
+    JOB_TITLE_SELECTOR = ".job_item__header-link .job-item__position"
+    JOB_COMPANY_SELECTOR = ".job_item__header-link .small.text-gray-800.opacity-75.font-weight-500"
+    JOB_SALARY_SELECTOR = ".job_item__header-link .text-success.text-nowrap"
+    JOB_DESCRIPTION_SELECTOR = ".js-truncated-text"
+    JOB_TAGS_SELECTOR = ".job-item__tags .badge"
+    JOB_PUBLICATION_DATE_SELECTOR = "span.text-nowrap[data-bs-original-title]"
     PAGINATION_ITEMS_SELECTOR = "ul.pagination_with_numbers li.page-item"
 
 
@@ -137,50 +143,53 @@ class DjinniSpider(scrapy.Spider):
             self.logger.warning("❌ Авторизація не знайдена. Видаляємо state.json.")
             os.remove("state.json")
 
-        jobs = response.css(DjinniSelectors.JOBS_LIST_SELECTOR)
-        item: DjinniScraperItem = DjinniScraperItem()
-        for job in jobs:
-            title = job.css("h2 > a::text").get(default="Not specified").strip()
-            salary = job.css("h2 > strong > span::text").get(default="Not specified").strip()
-            company = job.css("a.text-body.js-analytics-event::text").get(default="Not specified").strip()
-            views = job.css("div > div:nth-child(2) > span:nth-child(2)::text").get(default="Not specified").strip()
-            responses = job.css("div > div:nth-child(2) > span:nth-child(4)::text").get(default="Not specified").strip()
-            pub_date = job.css("div > div:nth-child(2) > span:nth-child(6)::attr(data-original-title)").get(default="Not specified").strip()
-            truncate_description = job.css("span.js-truncated-text::text").get(default="Not specified").strip()
-            raw_tags = job.css("h2 + div.fw-medium span::text").getall()
-            tags = [tag.strip() for tag in raw_tags if tag.strip() and '·' not in tag]
-            url = response.urljoin(job.css("h2 > a::attr(href)").get(default="Not specified"))
-            item.update(
-                title=title,
-                salary=salary,
-                company=company,
-                views=views,
-                responses=responses,
-                pub_date=pub_date,
-                truncate_description=truncate_description,
-                tags=tags,
-                url=url,
-                category=self.category,
-            )
-            yield item
+        for job in response.css(DjinniSelectors.JOBS_LIST_SELECTOR):
+            yield self._parse_job_card(job, response)
         self.logger.info("🛑 Закриваємо сторінку Playwright перед переходом на наступну.")
         await page.close()
         async for next_page_request in self.parse_pagination(response):
             yield next_page_request
 
+    def _parse_job_card(self, job, response) -> DjinniScraperItem:
+        """Extracts the current public Djinni listing-card fields."""
+        href = job.css(f"{DjinniSelectors.JOB_LINK_SELECTOR}::attr(href)").get()
+        tags = [
+            self._normalize_text(tag, default="")
+            for tag in job.css(f"{DjinniSelectors.JOB_TAGS_SELECTOR}::text").getall()
+        ]
+
+        return DjinniScraperItem(
+            title=self._normalize_text(job.css(f"{DjinniSelectors.JOB_TITLE_SELECTOR}::text").get()),
+            salary=self._normalize_text(job.css(f"{DjinniSelectors.JOB_SALARY_SELECTOR}::text").get()),
+            company=self._normalize_text(job.css(f"{DjinniSelectors.JOB_COMPANY_SELECTOR}::text").get()),
+            views="Not specified",
+            responses="Not specified",
+            pub_date=self._normalize_text(
+                job.css(f"{DjinniSelectors.JOB_PUBLICATION_DATE_SELECTOR}::attr(data-bs-original-title)").get()
+            ),
+            truncate_description=self._normalize_text(
+                job.css(f"{DjinniSelectors.JOB_DESCRIPTION_SELECTOR}::text").get()
+            ),
+            tags=[tag for tag in tags if tag],
+            url=response.urljoin(href) if href else "Not specified",
+            category=self.category,
+        )
+
+    @staticmethod
+    def _normalize_text(value, default="Not specified") -> str:
+        normalized = " ".join(value.split()) if value else ""
+        return normalized or default
+
     async def parse_pagination(self, response):
         """Обробляє пагінацію та переходить на наступну сторінку."""
-        next_page_element = response.css("li.page-item.active + li.page-item a.page-link")
-
-        if not next_page_element:
+        next_page_url = self._get_next_page_url(response)
+        if not next_page_url:
             self.logger.info("🛑 Наступної сторінки немає. Завершуємо парсинг.")
             return
 
+        next_page_element = response.css("li.page-item.active + li.page-item a.page-link")
         next_page_value = next_page_element.css("::text").get(default="").strip()
-        next_page_link = next_page_element.css("::attr(href)").get()
-
-        if next_page_value.isdigit() and next_page_link:
-            next_page_url = urllib_urljoin(response.url, next_page_link)
+        if next_page_value.isdigit():
             self.logger.info(f"➡ Переходимо на сторінку {next_page_value}: {next_page_url}")
 
             yield scrapy.Request(
@@ -196,6 +205,13 @@ class DjinniSpider(scrapy.Spider):
             )
         else:
             self.logger.warning("🚨 `parse_pagination()` не знайшла наступної сторінки!")
+
+    @staticmethod
+    def _get_next_page_url(response):
+        next_page_link = response.css(
+            "li.page-item.active + li.page-item:not(.disabled) a.page-link::attr(href)"
+        ).get()
+        return urllib_urljoin(response.url, next_page_link) if next_page_link else None
 
     async def errback_close_page(self, failure):
         """Закриває Playwright сторінку у випадку помилки."""

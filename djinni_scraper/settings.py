@@ -1,6 +1,7 @@
 import os
 import logging
 from logging.handlers import RotatingFileHandler
+from decouple import config
 from scrapy.utils.log import configure_logging
 
 BOT_NAME = "djinni_scraper"
@@ -16,9 +17,10 @@ USER_AGENT = None
 
 # === Playwright Settings ===
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
+PLAYWRIGHT_HEADLESS = config("PLAYWRIGHT_HEADLESS", default=True, cast=bool)
 PLAYWRIGHT_LAUNCH_OPTIONS = {
     # "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "headless": True,
+    "headless": PLAYWRIGHT_HEADLESS,
     "args": [
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu",
@@ -66,8 +68,6 @@ ROBOTSTXT_OBEY = False
 # Set settings whose default value is deprecated to a future-proof value
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
-
-# === Logging Settings ===
 
 # === Logging Settings ===
 LOG_LEVEL = "INFO"
