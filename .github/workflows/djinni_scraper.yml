@@ -42,10 +42,7 @@ jobs:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
       run: |
-        scrapy crawl djinni \
-          -a primary_keyword=Python \
-          -a exp_level=no_exp,1y,2y \
-          -a english_level=no_english,basic,pre,intermediate
+        scrapy crawl djinni -a profile=python
 
     - name: Run Djinni scraper for DATA Engineering jobs
       env:
@@ -55,10 +52,7 @@ jobs:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
       run: |
-        scrapy crawl djinni \
-          -a primary_keyword="Data Engineer" \
-          -a exp_level=no_exp,1y \
-          -a english_level=no_english,basic,pre,intermediate
+        scrapy crawl djinni -a profile=data_engineer
 
     - name: Run Djinni scraper for OTHER category jobs
       env:
@@ -68,10 +62,7 @@ jobs:
         TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
-        scrapy crawl djinni \
-          -a primary_keyword=Other \
-          -a exp_level=no_exp,1y \
-          -a english_level=no_english,basic,pre,intermediate
+        scrapy crawl djinni -a profile=other
 
     - name: Run Djinni scraper for SUPPORT jobs
       env:
@@ -81,10 +72,7 @@ jobs:
         TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
-        scrapy crawl djinni \
-          -a primary_keyword=Support \
-          -a exp_level=no_exp,1y \
-          -a english_level=no_english,basic,pre,intermediate
+        scrapy crawl djinni -a profile=support
 
     - name: Commit and push database changes
       run: |

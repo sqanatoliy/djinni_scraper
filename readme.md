@@ -48,15 +48,22 @@ playwright install-deps  # для Linux
 ```
 
 ### 5️⃣ Запуск скрапінгу
-    Фільтри можна задати через аргументи командного рядка.
-    Наприклад, для пошуку вакансій Python розробника додаємо такі аргументи: -a primary_keyword=Python
-    Для передачі множинних аргументів використовуємо кому.
-    Наприклад -a exp_level=no_exp,1y,2y,3y
-    Для збереження результатів використовуємо ключ -o jobs.json
-    Команда для пошуку вакансій Python розробника з досвідом 1-3 роки та рівнем англійської мови до intermediate включно:
+Основний інтерфейс — формальний profile, який централізовано визначає Djinni filters:
 
 ```bash
-scrapy crawl djinni -a primary_keyword=Python -a exp_level=no_exp,1y,2y,3y -a english_level=no_english,basic,pre,intermediate -o jobs.json
+scrapy crawl djinni -a profile=python -o jobs.json
+```
+
+Доступні profiles: `python`, `data_engineer`, `other`, `support`.
+
+Для ad-hoc пошуку збережено legacy arguments. `category` у цьому режимі — discovery slug, а не source vacancy category:
+
+```bash
+scrapy crawl djinni \
+  -a primary_keyword="Data Engineer" \
+  -a employment=remote \
+  -a category=data_engineer_remote \
+  -o jobs.json
 ```
 
 ## 📁 Структура проєкту
@@ -96,4 +103,3 @@ scrapy crawl djinni -a primary_keyword=Python -a exp_level=no_exp,1y,2y,3y -a en
 🔗 **Контакти**: Якщо маєте питання чи пропозиції, пишіть у Issues або Pull Requests!
 
 📝 **Ліцензія**: [MIT](./LICENSE)
-

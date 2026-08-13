@@ -11,12 +11,14 @@ from scrapy.exceptions import CloseSpider
 
 from djinni_scraper.adapters.djinni_vacancy import normalize_djinni_vacancy
 from djinni_scraper.parsers.djinni_jsonld import parse_detail_metadata
+from djinni_scraper.search_profiles import SearchProfile, get_search_profile
 from djinni_scraper.utils.url_utils import BASE_URL, get_start_url
 from ..items import DjinniScraperItem
 
 STATE_FILE = "state.json"
 LOGIN_URL = urllib_urljoin(BASE_URL, "/login?lang=uk&from=jobs&next=/jobs/")
 LOGIN_TIMEOUT_MS = 10_000
+LEGACY_DISCOVERY_ARGUMENT = "category"
 
 
 class DjinniSelectors:
@@ -40,17 +42,27 @@ class DjinniSpider(scrapy.Spider):
     name = "djinni"
     allowed_domains = ["djinni.co"]
 
-    def __init__(self, **kwargs):
+    def __init__(self, profile=None, **kwargs):
         super().__init__(**kwargs)
-        self.params = {}
-        for key, value in kwargs.items():
-            if "," in value:
-                self.params[key] = value.split(",")
-            else:
-                self.params[key] = value
+
+        self.search_profile: SearchProfile | None = None
+        self.notification_route: str | None = None
+        if profile is not None:
+            if kwargs:
+                conflicting_args = ", ".join(sorted(kwargs))
+                raise ValueError(
+                    "Djinni profile mode cannot be combined with legacy search arguments: "
+                    f"{conflicting_args}"
+                )
+            self.search_profile = get_search_profile(profile)
+            self.params = dict(self.search_profile.query_params)
+            self.category = self.search_profile.slug
+            self.notification_route = self.search_profile.notification_route
+        else:
+            self.params = self._legacy_query_params(kwargs)
+            self.category = self._legacy_discovery_profile(kwargs)
 
         self.start_urls = [get_start_url(self.params)]
-        self.category = self.params.get("primary_keyword", "all")
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -70,6 +82,7 @@ class DjinniSpider(scrapy.Spider):
 
     def start_requests(self):
         """Reuses a local session or starts one explicit login attempt."""
+        self._log_search_configuration()
         if self._storage_state_exists():
             self.logger.info(f"✅ Знайдено state.json! Використовуємо збережену сесію. URL: {self.start_urls[0]}")
             yield self._jobs_request(self.start_urls[0])
@@ -191,6 +204,39 @@ class DjinniSpider(scrapy.Spider):
         if missing:
             raise CloseSpider(f"Missing required Djinni configuration: {', '.join(missing)}")
         return credentials["DJINNI_EMAIL"], credentials["DJINNI_PASSWORD"]
+
+    @staticmethod
+    def _legacy_query_params(kwargs):
+        """Keeps ad-hoc CLI filters working while reserving category for discovery provenance."""
+        params = {}
+        for key, value in kwargs.items():
+            if key == LEGACY_DISCOVERY_ARGUMENT:
+                continue
+            params[key] = value.split(",") if isinstance(value, str) and "," in value else value
+        return params
+
+    @staticmethod
+    def _legacy_discovery_profile(kwargs):
+        value = kwargs.get(LEGACY_DISCOVERY_ARGUMENT, kwargs.get("primary_keyword", "all"))
+        return value.strip() if isinstance(value, str) and value.strip() else "all"
+
+    def _log_search_configuration(self):
+        if not self.search_profile:
+            return
+        query = self.search_profile.query
+        query_log = (
+            f"profile={self.search_profile.slug} "
+            f"primary_keyword={query.primary_keyword} "
+            f"exp_level={','.join(query.exp_level)} "
+            f"english_level={','.join(query.english_level)}"
+        )
+        if query.employment:
+            query_log = f"{query_log} employment={','.join(query.employment)}"
+        self.logger.info(
+            "Djinni %s notification_route=%s",
+            query_log,
+            self.notification_route,
+        )
 
     async def _wait_for_authenticated(self, page):
         try:
