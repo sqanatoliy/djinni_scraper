@@ -17,15 +17,12 @@ LISTING_URL = "https://djinni.co/jobs/?primary_keyword=Python&exp_level=1y"
 EDGE_CASES = json.loads((FIXTURES_DIR / "job_detail_jsonld_edge_cases.json").read_text())
 PERSISTED_LISTING_FIELDS = (
     "title",
-    "salary",
     "company",
-    "views",
-    "responses",
-    "pub_date",
-    "truncate_description",
+    "listing_published_at",
+    "listing_description",
     "tags",
     "url",
-    "category",
+    "discovery_profile",
 )
 
 
@@ -36,15 +33,12 @@ def detail_response(filename: str, url: str = DETAIL_URL) -> HtmlResponse:
 def listing_item() -> DjinniScraperItem:
     return DjinniScraperItem(
         title="Strong Junior/ Middle AI Engineer",
-        salary="до $2000",
         company="Softcery – Production AI Systems",
-        views="Not specified",
-        responses="Not specified",
-        pub_date="14:01 12.08.2026",
-        truncate_description="Softcery builds advanced AI systems.",
+        listing_published_at="14:01 12.08.2026",
+        listing_description="Softcery builds advanced AI systems.",
         tags=[],
         url=DETAIL_URL,
-        category="Python",
+        discovery_profile="Python",
     )
 
 
@@ -80,7 +74,6 @@ def test_full_real_dom_fixture_parses_confirmed_jsonld_fields_and_dom_metadata()
         }
     ]
     assert metadata["description"].startswith("Softcery builds advanced AI systems")
-    assert metadata["direct_apply"] is True
     assert metadata["raw_jsonld"]["identifier"] == 842583
     assert metadata["raw_djinni_metadata"] == {
         "language_requirements": [
@@ -209,8 +202,8 @@ def test_listing_card_creates_plain_scrapy_detail_request_with_preserved_context
     assert request.url == DETAIL_URL
     assert request.callback == spider.parse_job_detail
     assert request.meta.get("playwright") is None
-    assert request.cb_kwargs["listing_item"]["category"] == "Python"
-    assert request.cb_kwargs["listing_item"]["truncate_description"] == "Softcery builds advanced AI systems. Join our production AI team..."
+    assert request.cb_kwargs["listing_item"]["discovery_profile"] == "Python"
+    assert request.cb_kwargs["listing_item"]["listing_description"] == "Softcery builds advanced AI systems. Join our production AI team..."
 
 
 def test_detail_response_yields_one_enriched_item_while_preserving_listing_fields():
@@ -220,15 +213,12 @@ def test_detail_response_yields_one_enriched_item_while_preserving_listing_field
     assert isinstance(enriched_item, DjinniScraperItem)
     assert {field: enriched_item[field] for field in PERSISTED_LISTING_FIELDS} == {
         "title": "Strong Junior/ Middle AI Engineer",
-        "salary": "до $2000",
         "company": "Softcery – Production AI Systems",
-        "views": "Not specified",
-        "responses": "Not specified",
-        "pub_date": "14:01 12.08.2026",
-        "truncate_description": "Softcery builds advanced AI systems.",
+        "listing_published_at": "14:01 12.08.2026",
+        "listing_description": "Softcery builds advanced AI systems.",
         "tags": [],
         "url": DETAIL_URL,
-        "category": "Python",
+        "discovery_profile": "Python",
     }
     assert enriched_item["source_vacancy_id"] == "842583"
     assert enriched_item["description"].startswith("Softcery builds advanced AI systems")
@@ -255,7 +245,7 @@ def test_detail_parse_constructs_canonical_vacancy_without_calling_the_pipeline(
 
     def fail_if_called(*args, **kwargs):
         calls.append((args, kwargs))
-        raise AssertionError("parse_job_detail must not invoke the legacy pipeline")
+        raise AssertionError("parse_job_detail must not invoke the persistence pipeline")
 
     monkeypatch.setattr(SQLitePipeline, "process_item", fail_if_called)
     spider = DjinniSpider(primary_keyword="Python")

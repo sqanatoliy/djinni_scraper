@@ -12,12 +12,6 @@ from djinni_scraper.notifications.routing import (
 from djinni_scraper.notifications.telegram import TelegramClient
 from djinni_scraper.persistence.sqlite import NotificationIntent, SQLiteVacancyRepository
 
-
-class DjinniScraperPipeline:
-    def process_item(self, item, spider):
-        return item
-
-
 class SQLitePipeline:
     """Persists canonical observations and dispatches durable notification outbox events."""
 

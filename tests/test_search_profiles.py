@@ -179,45 +179,45 @@ def test_profile_cli_resolves_profile_and_sets_canonical_discovery_slug(slug):
     spider = DjinniSpider(profile=slug)
 
     assert spider.search_profile == get_search_profile(slug)
-    assert spider.category == slug
+    assert spider.discovery_profile == slug
     assert spider.notification_route == get_search_profile(slug).notification_route
     assert _query(spider.start_urls[0]) == _query(get_start_url(get_search_profile(slug).query_params))
 
 
-def test_profile_cli_rejects_unknown_and_mixed_legacy_arguments():
+def test_profile_cli_rejects_unknown_and_mixed_ad_hoc_arguments():
     with pytest.raises(ValueError, match="Unknown Djinni search profile"):
         DjinniSpider(profile="foobar")
-    with pytest.raises(ValueError, match="cannot be combined with legacy search arguments: primary_keyword"):
+    with pytest.raises(ValueError, match="cannot be combined with ad-hoc search arguments: primary_keyword"):
         DjinniSpider(profile="python", primary_keyword="DevOps")
-    with pytest.raises(ValueError, match="cannot be combined with legacy search arguments: employment"):
+    with pytest.raises(ValueError, match="cannot be combined with ad-hoc search arguments: employment"):
         DjinniSpider(profile="data_engineer", employment="remote")
 
 
-def test_no_argument_and_legacy_ad_hoc_cli_behavior_are_explicit_and_preserved():
+def test_no_argument_and_ad_hoc_cli_behavior_are_explicit_and_preserved():
     default_spider = DjinniSpider()
     assert default_spider.search_profile is None
-    assert default_spider.category == "all"
+    assert default_spider.discovery_profile == "all"
     assert default_spider.start_urls == [f"{BASE_URL}?"]
 
-    legacy_spider = DjinniSpider(
+    ad_hoc_spider = DjinniSpider(
         primary_keyword="DevOps",
         exp_level="no_exp,2y",
         english_level="intermediate",
         employment="remote",
         category="devops",
     )
-    assert legacy_spider.search_profile is None
-    assert legacy_spider.category == "devops"
-    assert _query(legacy_spider.start_urls[0]) == {
+    assert ad_hoc_spider.search_profile is None
+    assert ad_hoc_spider.discovery_profile == "devops"
+    assert _query(ad_hoc_spider.start_urls[0]) == {
         "primary_keyword": ["DevOps"],
         "exp_level": ["no_exp", "2y"],
         "english_level": ["intermediate"],
         "employment": ["remote"],
     }
-    assert "%25" not in legacy_spider.start_urls[0]
+    assert "%25" not in ad_hoc_spider.start_urls[0]
 
     employment_only_spider = DjinniSpider(primary_keyword="DevOps", employment="remote")
-    assert employment_only_spider.category == "DevOps"
+    assert employment_only_spider.discovery_profile == "DevOps"
     assert _query(employment_only_spider.start_urls[0])["employment"] == ["remote"]
 
 
@@ -226,9 +226,9 @@ def test_profile_slug_reaches_listing_detail_and_canonical_discovery_without_ove
     listing_response = _listing_response()
     listing_item = spider._parse_job_card(listing_response.css(DjinniSelectors.JOBS_LIST_SELECTOR)[0], listing_response)
 
-    assert listing_item["category"] == "data_engineer"
+    assert listing_item["discovery_profile"] == "data_engineer"
     request = spider._detail_request(listing_item)
-    assert request.cb_kwargs["listing_item"]["category"] == "data_engineer"
+    assert request.cb_kwargs["listing_item"]["discovery_profile"] == "data_engineer"
 
     enriched_item = list(spider.parse_job_detail(_detail_response(), listing_item))[0]
     canonical_vacancy = enriched_item["canonical_vacancy"]
@@ -249,7 +249,7 @@ def test_custom_employment_filter_keeps_category_as_discovery_slug_only():
 
     assert _query(spider.start_urls[0])["employment"] == ["remote"]
     assert "category" not in _query(spider.start_urls[0])
-    assert listing_item["category"] == "data_engineer_remote"
+    assert listing_item["discovery_profile"] == "data_engineer_remote"
 
     enriched_item = list(spider.parse_job_detail(_detail_response(), listing_item))[0]
     assert enriched_item["canonical_vacancy"].discovery_profiles == ("data_engineer_remote",)

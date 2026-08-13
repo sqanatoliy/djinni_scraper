@@ -16,7 +16,7 @@ from djinni_scraper.pipelines import SQLitePipeline
 
 class FakeSpider:
     logger = logging.getLogger("test.sqlite_pipeline")
-    category = "python"
+    discovery_profile = "python"
     notification_route = "main"
 
 
@@ -49,13 +49,10 @@ def canonical_vacancy(**overrides) -> Vacancy:
 
 def parser_item(vacancy: Vacancy | None = None, *, observation_complete: bool = True) -> DjinniScraperItem:
     values = {
-        # These parser transport fields deliberately differ from the canonical Vacancy.
-        "title": "Ignored legacy title",
-        "salary": "Ignored legacy salary",
-        "views": "Ignored legacy views",
-        "responses": "Ignored legacy responses",
-        "truncate_description": "Ignored legacy description",
-        "category": "python",
+        # Source transport fields deliberately differ from the canonical Vacancy.
+        "title": "Ignored source title",
+        "listing_description": "Ignored source description",
+        "discovery_profile": "python",
         "canonical_snapshot_complete": observation_complete,
     }
     if vacancy is not None:
@@ -101,7 +98,7 @@ def test_pipeline_enqueues_canonical_insert_and_dispatcher_formats_canonical_vac
     message = telegram_client.calls[0][1]
     assert "Canonical \\* title" in message
     assert "Full canonical description" in message
-    assert "Ignored legacy" not in message
+    assert "Ignored source" not in message
 
 
 def test_updated_unchanged_and_discovery_only_observations_do_not_enqueue_or_send(opened_pipeline):

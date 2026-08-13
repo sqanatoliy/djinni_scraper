@@ -23,7 +23,6 @@ USER_AGENT = None
 PLAYWRIGHT_BROWSER_TYPE = "chromium"
 PLAYWRIGHT_HEADLESS = config("PLAYWRIGHT_HEADLESS", default=True, cast=bool)
 PLAYWRIGHT_LAUNCH_OPTIONS = {
-    # "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "headless": PLAYWRIGHT_HEADLESS,
     "args": [
         "--disable-blink-features=AutomationControlled",
@@ -40,16 +39,10 @@ PLAYWRIGHT_CONTEXTS = {
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "java_script_enabled": True,
         "ignore_https_errors": True,
-        # "proxy": {
-        #     "server": "http://myproxy.com:3128",
-        #     "username": "user",
-        #     "password": "pass",
-        # },
         "extra_http_headers": {
             "Accept-Language": "en-US,en;q=0.9,uk-UA;q=0.8,uk;q=0.7",
             "Referer": "https://djinni.co/",
         },
-        # "storage_state": "state.json",
     }
 }
 if os.path.exists("state.json"):
@@ -75,6 +68,7 @@ FEED_EXPORT_ENCODING = "utf-8"
 
 # === Logging Settings ===
 LOG_LEVEL = "INFO"
+TELNETCONSOLE_ENABLED = False
 # === Logging directory settings ===
 LOGS_DIR = "logs"  # Directory for saving logs
 LOGS_FILE = os.path.join(LOGS_DIR, "djinni_scraper.log")  # Full path to the log file

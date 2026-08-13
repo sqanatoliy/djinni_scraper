@@ -27,7 +27,6 @@ DETAIL_METADATA_SCALAR_FIELDS = (
     "industry",
     "job_category",
     "description",
-    "direct_apply",
     "raw_jsonld",
 )
 
@@ -105,7 +104,6 @@ def parse_detail_metadata(response, logger=None) -> dict:
         "location_cities": locations["cities"],
         "applicant_locations": _as_list_of_mappings(job_posting.get("applicantLocationRequirements")),
         "description": _optional_text(job_posting.get("description")),
-        "direct_apply": job_posting.get("directApply") if isinstance(job_posting.get("directApply"), bool) else None,
         "raw_jsonld": job_posting,
         "raw_djinni_metadata": raw_djinni_metadata,
     }

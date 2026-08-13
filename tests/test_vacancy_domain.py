@@ -96,7 +96,7 @@ def test_to_dict_is_json_compatible_and_preserves_datetime_timezone():
 
 def test_domain_model_does_not_leak_known_djinni_fields_or_dependencies():
     field_names = {field_.name for field_ in fields(Vacancy)}
-    assert {"truncate_description", "detail_title", "pub_date", "raw_jsonld", "raw_djinni_metadata"}.isdisjoint(
+    assert {"listing_description", "detail_title", "listing_published_at", "raw_jsonld", "raw_djinni_metadata"}.isdisjoint(
         field_names
     )
 

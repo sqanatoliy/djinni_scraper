@@ -1,22 +1,18 @@
-# Define here the models for your scraped items
-#
-# See documentation in:
-# https://docs.scrapy.org/en/latest/topics/items.html
+"""Djinni-only Scrapy transport object used before canonical normalization."""
 
 import scrapy
 
 
 class DjinniScraperItem(scrapy.Item):
+    """Carries source parsing evidence; ``Vacancy`` is the domain boundary."""
+
     title = scrapy.Field()
-    salary = scrapy.Field()
     company = scrapy.Field()
-    views = scrapy.Field()
-    responses = scrapy.Field()
-    pub_date = scrapy.Field()
-    truncate_description = scrapy.Field()
+    listing_published_at = scrapy.Field()
+    listing_description = scrapy.Field()
     tags = scrapy.Field()
     url = scrapy.Field()
-    category = scrapy.Field()
+    discovery_profile = scrapy.Field()
     source_vacancy_id = scrapy.Field()
     detail_title = scrapy.Field()
     canonical_url = scrapy.Field()
@@ -36,7 +32,6 @@ class DjinniScraperItem(scrapy.Item):
     location_cities = scrapy.Field()
     applicant_locations = scrapy.Field()
     description = scrapy.Field()
-    direct_apply = scrapy.Field()
     raw_jsonld = scrapy.Field()
     raw_djinni_metadata = scrapy.Field()
     canonical_vacancy = scrapy.Field()

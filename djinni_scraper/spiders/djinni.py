@@ -18,7 +18,7 @@ from ..items import DjinniScraperItem
 STATE_FILE = "state.json"
 LOGIN_URL = urllib_urljoin(BASE_URL, "/login?lang=uk&from=jobs&next=/jobs/")
 LOGIN_TIMEOUT_MS = 10_000
-LEGACY_DISCOVERY_ARGUMENT = "category"
+AD_HOC_DISCOVERY_ARGUMENT = "category"
 
 
 class DjinniSelectors:
@@ -31,7 +31,6 @@ class DjinniSelectors:
     JOB_LINK_SELECTOR = ".job_item__header-link"
     JOB_TITLE_SELECTOR = ".job_item__header-link .job-item__position"
     JOB_COMPANY_SELECTOR = ".job_item__header-link .small.text-gray-800.opacity-75.font-weight-500"
-    JOB_SALARY_SELECTOR = ".job_item__header-link .text-success.text-nowrap"
     JOB_DESCRIPTION_SELECTOR = ".js-truncated-text"
     JOB_TAGS_SELECTOR = ".job-item__tags .badge"
     JOB_PUBLICATION_DATE_SELECTOR = "span.text-nowrap[data-bs-original-title]"
@@ -51,16 +50,16 @@ class DjinniSpider(scrapy.Spider):
             if kwargs:
                 conflicting_args = ", ".join(sorted(kwargs))
                 raise ValueError(
-                    "Djinni profile mode cannot be combined with legacy search arguments: "
+                    "Djinni profile mode cannot be combined with ad-hoc search arguments: "
                     f"{conflicting_args}"
                 )
             self.search_profile = get_search_profile(profile)
             self.params = dict(self.search_profile.query_params)
-            self.category = self.search_profile.slug
+            self.discovery_profile = self.search_profile.slug
             self.notification_route = self.search_profile.notification_route
         else:
-            self.params = self._legacy_query_params(kwargs)
-            self.category = self._legacy_discovery_profile(kwargs)
+            self.params = self._ad_hoc_query_params(kwargs)
+            self.discovery_profile = self._ad_hoc_discovery_profile(kwargs)
 
         self.start_urls = [get_start_url(self.params)]
 
@@ -206,18 +205,18 @@ class DjinniSpider(scrapy.Spider):
         return credentials["DJINNI_EMAIL"], credentials["DJINNI_PASSWORD"]
 
     @staticmethod
-    def _legacy_query_params(kwargs):
-        """Keeps ad-hoc CLI filters working while reserving category for discovery provenance."""
+    def _ad_hoc_query_params(kwargs):
+        """Builds ad-hoc filters while reserving ``category`` as discovery provenance."""
         params = {}
         for key, value in kwargs.items():
-            if key == LEGACY_DISCOVERY_ARGUMENT:
+            if key == AD_HOC_DISCOVERY_ARGUMENT:
                 continue
             params[key] = value.split(",") if isinstance(value, str) and "," in value else value
         return params
 
     @staticmethod
-    def _legacy_discovery_profile(kwargs):
-        value = kwargs.get(LEGACY_DISCOVERY_ARGUMENT, kwargs.get("primary_keyword", "all"))
+    def _ad_hoc_discovery_profile(kwargs):
+        value = kwargs.get(AD_HOC_DISCOVERY_ARGUMENT, kwargs.get("primary_keyword", "all"))
         return value.strip() if isinstance(value, str) and value.strip() else "all"
 
     def _log_search_configuration(self):
@@ -326,19 +325,16 @@ class DjinniSpider(scrapy.Spider):
 
         return DjinniScraperItem(
             title=self._normalize_text(job.css(f"{DjinniSelectors.JOB_TITLE_SELECTOR}::text").get()),
-            salary=self._normalize_text(job.css(f"{DjinniSelectors.JOB_SALARY_SELECTOR}::text").get()),
             company=self._normalize_text(job.css(f"{DjinniSelectors.JOB_COMPANY_SELECTOR}::text").get()),
-            views="Not specified",
-            responses="Not specified",
-            pub_date=self._normalize_text(
+            listing_published_at=self._normalize_text(
                 job.css(f"{DjinniSelectors.JOB_PUBLICATION_DATE_SELECTOR}::attr(data-bs-original-title)").get()
             ),
-            truncate_description=self._normalize_text(
+            listing_description=self._normalize_text(
                 job.css(f"{DjinniSelectors.JOB_DESCRIPTION_SELECTOR}::text").get()
             ),
             tags=[tag for tag in tags if tag],
             url=response.urljoin(href) if href else "Not specified",
-            category=self.category,
+            discovery_profile=self.discovery_profile,
         )
 
     @staticmethod

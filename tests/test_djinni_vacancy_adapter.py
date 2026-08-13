@@ -22,15 +22,12 @@ def full_djinni_item() -> DjinniScraperItem:
     )
     item = DjinniScraperItem(
         title="Listing title",
-        salary="$$",
         company="Listing company",
-        views="Not specified",
-        responses="Not specified",
-        pub_date="14:01 12.08.2026",
-        truncate_description="Listing description",
+        listing_published_at="14:01 12.08.2026",
+        listing_description="Listing description",
         tags=["Продуктова компанія"],
         url=DETAIL_URL,
-        category="python",
+        discovery_profile="python",
     )
     item.update(parse_detail_metadata(response))
     return item
@@ -101,14 +98,14 @@ def test_url_title_description_and_company_follow_structured_then_listing_preced
     assert fallback.company.name == "Listing company"
 
 
-def test_structured_salary_is_used_without_guessing_legacy_salary_string():
+def test_missing_structured_compensation_is_not_guessed_from_listing_text():
     item = full_djinni_item()
-    item.update({"salary_min": None, "salary_max": None, "salary_currency": None, "salary_unit": None, "salary": "$$"})
+    item.update({"salary_min": None, "salary_max": None, "salary_currency": None, "salary_unit": None})
 
     assert normalize_djinni_vacancy(item, scraped_at=SCRAPED_AT).compensation is None
 
 
-def test_legacy_placeholders_and_malformed_optional_values_degrade_safely(caplog):
+def test_missing_placeholders_and_malformed_optional_values_degrade_safely(caplog):
     item = full_djinni_item()
     item.update(
         {
@@ -119,7 +116,7 @@ def test_legacy_placeholders_and_malformed_optional_values_degrade_safely(caplog
             "job_category": "Not specified",
             "industry": "",
             "tags": ["Not specified", "  "],
-            "category": "Not specified",
+            "discovery_profile": "Not specified",
             "raw_djinni_metadata": {"language_requirements": [{"language": "", "level": "B2"}]},
         }
     )

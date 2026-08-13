@@ -73,7 +73,9 @@ class TelegramRouteResolver:
 
 def notification_context_from_spider(spider) -> NotificationContext:
     """Preserves formal profile routes and gives ad-hoc crawls the historical main default."""
-    profile_slug = getattr(spider, "category", None)
+    profile_slug = getattr(spider, "discovery_profile", None)
+    if profile_slug is None:
+        profile_slug = getattr(spider, "category", None)
     if not isinstance(profile_slug, str) or not profile_slug.strip():
         profile_slug = "all"
     route = getattr(spider, "notification_route", None)

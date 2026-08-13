@@ -187,7 +187,7 @@ def test_initialization_creates_schema_v3_with_normalized_discoveries_outbox_and
     assert {"vacancies", "vacancy_discoveries", "notification_outbox"}.issubset(tables)
     assert {"content_hash", "first_seen_at", "last_seen_at"}.issubset(vacancy_columns)
     assert "discovery_profiles_json" not in vacancy_columns
-    assert _legacy_columns().isdisjoint(vacancy_columns)
+    assert _source_transport_only_columns().isdisjoint(vacancy_columns)
     assert {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"} == discovery_columns
     assert {"vacancy_id", "event_type", "route", "attempt_count", "next_attempt_at", "delivered_at"}.issubset(outbox_columns)
     assert {"idx_vacancies_source", "idx_vacancies_source_vacancy_id", "idx_vacancies_published_at", "idx_vacancies_last_seen_at"}.issubset(vacancy_indexes)
@@ -567,5 +567,5 @@ def test_repository_creates_missing_parent_directories_and_round_trips_full_valu
     repo.close()
 
 
-def _legacy_columns() -> set[str]:
-    return {"truncate_description", "pub_date", "views", "responses", "raw_jsonld"}
+def _source_transport_only_columns() -> set[str]:
+    return {"listing_description", "listing_published_at", "raw_jsonld"}

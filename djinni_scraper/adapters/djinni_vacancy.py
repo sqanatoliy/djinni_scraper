@@ -13,7 +13,7 @@ from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequire
 
 LOGGER = logging.getLogger(__name__)
 SOURCE = "djinni"
-LEGACY_MISSING_VALUES = frozenset({"not specified"})
+MISSING_PLACEHOLDER_VALUES = frozenset({"not specified"})
 
 
 def normalize_djinni_vacancy(
@@ -29,7 +29,7 @@ def normalize_djinni_vacancy(
 
     published_at = _parse_source_date(_value(item, "date_posted"), "date_posted", logger)
     if published_at is None:
-        published_at = _parse_listing_date(_value(item, "pub_date"), logger)
+        published_at = _parse_listing_published_at(_value(item, "listing_published_at"), logger)
 
     company_name = _first_text(item, "company_name", "company")
     company_url = _optional_text(_value(item, "company_url"))
@@ -40,7 +40,7 @@ def normalize_djinni_vacancy(
         source_vacancy_id=_optional_text(_value(item, "source_vacancy_id")),
         url=url or "",
         title=title or "",
-        description=_first_text(item, "description", "truncate_description"),
+        description=_first_text(item, "description", "listing_description"),
         company=company,
         compensation=_compensation(item),
         employment_type=_optional_text(_value(item, "employment_type")),
@@ -54,7 +54,7 @@ def normalize_djinni_vacancy(
         published_at=published_at,
         valid_through=_parse_source_date(_value(item, "valid_through"), "valid_through", logger),
         scraped_at=scraped_at or datetime.now(timezone.utc),
-        discovery_profiles=_text_values(_value(item, "category")),
+        discovery_profiles=_text_values(_value(item, "discovery_profile")),
         raw_source_metadata=_raw_source_metadata(item),
     )
 
@@ -75,7 +75,7 @@ def _optional_text(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if not text or text.casefold() in LEGACY_MISSING_VALUES:
+    if not text or text.casefold() in MISSING_PLACEHOLDER_VALUES:
         return None
     return text
 
@@ -198,7 +198,7 @@ def _parse_source_date(value: Any, field_name: str, logger: logging.Logger) -> d
         return None
 
 
-def _parse_listing_date(value: Any, logger: logging.Logger) -> datetime | None:
+def _parse_listing_published_at(value: Any, logger: logging.Logger) -> datetime | None:
     text = _optional_text(value)
     if text is None:
         return None
@@ -207,7 +207,7 @@ def _parse_listing_date(value: Any, logger: logging.Logger) -> datetime | None:
             return datetime.strptime(text, pattern)
         except ValueError:
             continue
-    logger.warning("Ignoring unparseable legacy Djinni pub_date: %r", text)
+    logger.warning("Ignoring unparseable Djinni listing publication date: %r", text)
     return None
 
 
