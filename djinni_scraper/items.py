@@ -39,3 +39,4 @@ class DjinniScraperItem(scrapy.Item):
     direct_apply = scrapy.Field()
     raw_jsonld = scrapy.Field()
     raw_djinni_metadata = scrapy.Field()
+    canonical_vacancy = scrapy.Field()

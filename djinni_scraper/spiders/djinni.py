@@ -9,6 +9,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapy import signals
 from scrapy.exceptions import CloseSpider
 
+from djinni_scraper.adapters.djinni_vacancy import normalize_djinni_vacancy
 from djinni_scraper.parsers.djinni_jsonld import parse_detail_metadata
 from djinni_scraper.utils.url_utils import BASE_URL, get_start_url
 from ..items import DjinniScraperItem
@@ -236,6 +237,13 @@ class DjinniSpider(scrapy.Spider):
         enriched_item.update(detail_metadata)
 
         self._log_detail_mismatches(listing_item, detail_metadata)
+        try:
+            enriched_item["canonical_vacancy"] = normalize_djinni_vacancy(
+                enriched_item,
+                logger=self.logger,
+            )
+        except ValueError as error:
+            self.logger.error("Djinni canonical vacancy normalization failed for %s: %s", response.url, error)
         yield enriched_item
 
     def errback_detail_request(self, failure):

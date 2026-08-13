@@ -4,9 +4,12 @@ from pathlib import Path
 import pytest
 from scrapy.http import HtmlResponse
 
+from djinni_scraper.domain.vacancy import Vacancy
 from djinni_scraper.items import DjinniScraperItem
 from djinni_scraper.parsers.djinni_jsonld import find_job_posting, parse_detail_metadata
+from djinni_scraper.pipelines import SQLitePipeline
 from djinni_scraper.spiders.djinni import DjinniSelectors, DjinniSpider
+from djinni_scraper.utils.telegram_utils import Telegram
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "djinni"
@@ -230,6 +233,9 @@ def test_detail_response_yields_one_enriched_item_while_preserving_listing_field
     }
     assert enriched_item["source_vacancy_id"] == "842583"
     assert enriched_item["description"].startswith("Softcery builds advanced AI systems")
+    assert isinstance(enriched_item["canonical_vacancy"], Vacancy)
+    assert enriched_item["canonical_vacancy"].source == "djinni"
+    assert enriched_item["canonical_vacancy"].source_vacancy_id == "842583"
 
 
 def test_detail_without_jobposting_yields_safe_listing_item(caplog):
@@ -241,3 +247,19 @@ def test_detail_without_jobposting_yields_safe_listing_item(caplog):
     assert item["source_vacancy_id"] is None
     assert item["raw_jsonld"] is None
     assert "no valid JobPosting JSON-LD" in caplog.text
+
+
+def test_detail_parse_constructs_canonical_vacancy_without_calling_the_legacy_pipeline(monkeypatch):
+    calls = []
+
+    def fail_if_called(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("parse_job_detail must not invoke the legacy pipeline")
+
+    monkeypatch.setattr(SQLitePipeline, "process_item", fail_if_called)
+    monkeypatch.setattr(Telegram, "send_job_to_telegram", fail_if_called)
+    spider = DjinniSpider(primary_keyword="Python")
+
+    item = list(spider.parse_job_detail(detail_response("job_detail_full.html"), listing_item()))[0]
+    assert isinstance(item["canonical_vacancy"], Vacancy)
+    assert calls == []
