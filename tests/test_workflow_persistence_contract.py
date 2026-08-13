@@ -58,6 +58,10 @@ def test_workflow_serializes_all_profiles_between_one_restore_and_one_validated_
         profile_indices.append(workflow.index(name))
         assert f"DB_PATH: ./{DB_PATH}" in step
         assert f"scrapy crawl djinni -a profile={slug}" in step
+        assert "TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}" in step
+        assert "CHAT_ID: ${{ secrets.CHAT_ID }}" in step
+        assert "NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}" in step
+        assert "NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}" in step
     assert profile_indices == sorted(profile_indices)
     assert restore_index < profile_indices[0] < profile_indices[-1] < validation_index
 
@@ -73,7 +77,9 @@ def test_workflow_saves_valid_partial_progress_but_not_an_invalid_database():
     assert "mode=ro" in validation
     assert 'PRAGMA quick_check;' in validation
     assert 'PRAGMA user_version;' in validation
+    assert 'schema_version == (3,)' in validation
     assert "name = 'vacancies'" in validation
+    assert "name = 'notification_outbox'" in validation
     assert 'output.write(f"valid={' in validation
     assert "if: always() && steps.vacancy-db-state.outputs.valid == 'true'" in save
 

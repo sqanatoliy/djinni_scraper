@@ -1,9 +1,4 @@
-"""SQLite persistence for canonical vacancy observations.
-
-Schema v2 keeps one current canonical snapshot per logical vacancy and stores
-search-profile provenance separately.  The repository is the only layer that
-decides identity, updates, and discovery merges.
-"""
+"""SQLite persistence for canonical vacancy observations and notification outbox."""
 
 from __future__ import annotations
 
@@ -21,10 +16,13 @@ from urllib.parse import urlsplit, urlunsplit
 from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequirement, Location, Vacancy
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _V1_SCHEMA_VERSION = 1
+_V2_SCHEMA_VERSION = 2
 VACANCIES_TABLE = "vacancies"
 DISCOVERIES_TABLE = "vacancy_discoveries"
+OUTBOX_TABLE = "notification_outbox"
+VACANCY_INSERTED_EVENT = "VACANCY_INSERTED"
 
 _V1_CANONICAL_COLUMNS = frozenset(
     {
@@ -62,6 +60,21 @@ _V2_CANONICAL_COLUMNS = (
 _DISCOVERY_COLUMNS = frozenset(
     {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"}
 )
+_OUTBOX_COLUMNS = frozenset(
+    {
+        "id",
+        "vacancy_id",
+        "event_type",
+        "route",
+        "profile_slug",
+        "created_at",
+        "attempt_count",
+        "last_attempt_at",
+        "next_attempt_at",
+        "delivered_at",
+        "last_error",
+    }
+)
 _CONTENT_FIELDS = (
     "url",
     "title",
@@ -91,11 +104,13 @@ class PersistenceStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class PersistenceResult:
-    """Result consumed by the temporary Telegram bridge and future DJ-8 code."""
+    """Result for canonical persistence and transactional notification intent."""
 
     status: PersistenceStatus
     vacancy_id: int
     discovery_added: bool
+    notification_enqueued: bool = False
+    notification_event_id: int | None = None
 
     @property
     def inserted(self) -> bool:
@@ -110,6 +125,40 @@ class VacancyDiscovery:
     profile_slug: str
     first_discovered_at: datetime
     last_discovered_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationIntent:
+    """Observation-local routing metadata captured only for a new vacancy event."""
+
+    route: str
+    profile_slug: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.route, str) or not self.route.strip():
+            raise ValueError("notification route must be a non-empty string")
+        object.__setattr__(self, "route", self.route.strip())
+        if self.profile_slug is not None:
+            if not isinstance(self.profile_slug, str) or not self.profile_slug.strip():
+                raise ValueError("notification profile_slug must be a non-empty string or None")
+            object.__setattr__(self, "profile_slug", self.profile_slug.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationOutboxEvent:
+    """Persisted delivery state for one notification intent."""
+
+    id: int
+    vacancy_id: int
+    event_type: str
+    route: str
+    profile_slug: str | None
+    created_at: datetime
+    attempt_count: int
+    last_attempt_at: datetime | None
+    next_attempt_at: datetime | None
+    delivered_at: datetime | None
+    last_error: str | None
 
 
 class IdentityConflictError(RuntimeError):
@@ -151,6 +200,7 @@ class SQLiteVacancyRepository:
         discovery_profiles: Iterable[str] | None = None,
         observation_complete: bool,
         observed_at: datetime,
+        notification_intent: NotificationIntent | None = None,
     ) -> PersistenceResult:
         """Atomically resolves identity, persists the snapshot, and records discovery.
 
@@ -188,6 +238,14 @@ class SQLiteVacancyRepository:
                 profile_slugs=profiles,
                 observed_at=observed_at_text,
             )
+            notification_event_id = None
+            if status is PersistenceStatus.INSERTED and notification_intent is not None:
+                notification_event_id = self._enqueue_notification(
+                    connection,
+                    vacancy_id=vacancy_id,
+                    notification_intent=notification_intent,
+                    created_at=observed_at_text,
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -197,6 +255,8 @@ class SQLiteVacancyRepository:
             status=status,
             vacancy_id=vacancy_id,
             discovery_added=discovery_added,
+            notification_enqueued=notification_event_id is not None,
+            notification_event_id=notification_event_id,
         )
 
     def insert_vacancy(self, vacancy: Vacancy) -> PersistenceResult:
@@ -226,6 +286,67 @@ class SQLiteVacancyRepository:
             "SELECT * FROM vacancies WHERE identity_key = ?", (identity_key,)
         ).fetchone()
         return self._vacancy_from_row(row) if row else None
+
+    def get_vacancy_by_id(self, vacancy_id: int) -> Vacancy | None:
+        """Reads one canonical snapshot for a notification event."""
+        row = self._require_connection().execute(
+            "SELECT * FROM vacancies WHERE id = ?", (vacancy_id,)
+        ).fetchone()
+        return self._vacancy_from_row(row) if row else None
+
+    def get_notification_event(self, event_id: int) -> NotificationOutboxEvent | None:
+        """Reads one persisted outbox event for diagnostics and tests."""
+        row = self._require_connection().execute(
+            "SELECT * FROM notification_outbox WHERE id = ?", (event_id,)
+        ).fetchone()
+        return _row_to_outbox_event(row) if row else None
+
+    def list_due_notification_events(
+        self, *, now: datetime, limit: int
+    ) -> tuple[NotificationOutboxEvent, ...]:
+        """Returns pending notifications in deterministic FIFO-like order."""
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("notification batch limit must be a positive integer")
+        now_text = _utc_timestamp(now)
+        rows = self._require_connection().execute(
+            """
+            SELECT * FROM notification_outbox
+            WHERE delivered_at IS NULL
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            ORDER BY created_at, id
+            LIMIT ?
+            """,
+            (now_text, limit),
+        )
+        return tuple(_row_to_outbox_event(row) for row in rows)
+
+    def mark_notification_delivered(self, event_id: int, *, attempted_at: datetime) -> None:
+        """Records one successful delivery in its own short transaction."""
+        attempted_at_text = _utc_timestamp(attempted_at)
+        self._update_notification_delivery(
+            event_id,
+            last_attempt_at=attempted_at_text,
+            delivered_at=attempted_at_text,
+            next_attempt_at=None,
+            last_error=None,
+        )
+
+    def mark_notification_failed(
+        self,
+        event_id: int,
+        *,
+        attempted_at: datetime,
+        next_attempt_at: datetime,
+        error: str,
+    ) -> None:
+        """Keeps a failed event pending and persists bounded safe diagnostics."""
+        self._update_notification_delivery(
+            event_id,
+            last_attempt_at=_utc_timestamp(attempted_at),
+            delivered_at=None,
+            next_attempt_at=_utc_timestamp(next_attempt_at),
+            last_error=_safe_outbox_error(error),
+        )
 
     def get_discoveries(self, vacancy_id: int) -> tuple[VacancyDiscovery, ...]:
         """Returns normalized provenance in deterministic profile order."""
@@ -410,6 +531,67 @@ class SQLiteVacancyRepository:
                 )
         return discovery_added
 
+    @staticmethod
+    def _enqueue_notification(
+        connection: sqlite3.Connection,
+        *,
+        vacancy_id: int,
+        notification_intent: NotificationIntent,
+        created_at: str,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            INSERT INTO notification_outbox (
+                vacancy_id, event_type, route, profile_slug, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                vacancy_id,
+                VACANCY_INSERTED_EVENT,
+                notification_intent.route,
+                notification_intent.profile_slug,
+                created_at,
+            ),
+        )
+        return cursor.lastrowid
+
+    def _update_notification_delivery(
+        self,
+        event_id: int,
+        *,
+        last_attempt_at: str,
+        delivered_at: str | None,
+        next_attempt_at: str | None,
+        last_error: str | None,
+    ) -> None:
+        connection = self._require_connection()
+        try:
+            connection.execute("BEGIN")
+            cursor = connection.execute(
+                """
+                UPDATE notification_outbox
+                SET attempt_count = attempt_count + 1,
+                    last_attempt_at = :last_attempt_at,
+                    delivered_at = :delivered_at,
+                    next_attempt_at = :next_attempt_at,
+                    last_error = :last_error
+                WHERE id = :event_id AND delivered_at IS NULL
+                """,
+                {
+                    "event_id": event_id,
+                    "last_attempt_at": last_attempt_at,
+                    "delivered_at": delivered_at,
+                    "next_attempt_at": next_attempt_at,
+                    "last_error": last_error,
+                },
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Notification event {event_id} is not pending")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
     def _vacancy_from_row(self, row: Mapping[str, Any]) -> Vacancy:
         return row_to_vacancy(
             row,
@@ -423,33 +605,39 @@ class SQLiteVacancyRepository:
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Creates schema v2 or migrates a canonical v1 database in place."""
+    """Creates schema v3 or migrates canonical v1/v2 databases in place."""
     connection.execute("PRAGMA foreign_keys = ON")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
 
     if current_version == 0 and not vacancy_columns:
-        _create_new_v2_schema(connection)
+        _create_new_v3_schema(connection)
         return
     if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(vacancy_columns):
         _migrate_v1_to_v2(connection)
+        current_version = _V2_SCHEMA_VERSION
+    if current_version == _V2_SCHEMA_VERSION:
+        _validate_v2_schema(connection)
+        _migrate_v2_to_v3(connection)
         return
     if current_version == SCHEMA_VERSION:
-        _validate_v2_schema(connection)
+        _validate_v3_schema(connection)
         return
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"
         )
-    raise RuntimeError("Existing vacancies table is not canonical schema v1 or v2")
+    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, or v3")
 
 
-def _create_new_v2_schema(connection: sqlite3.Connection) -> None:
+def _create_new_v3_schema(connection: sqlite3.Connection) -> None:
     try:
         connection.execute("BEGIN")
         _create_vacancies_table(connection)
         _create_discoveries_table(connection)
+        _create_outbox_table(connection)
         _create_v2_indexes(connection)
+        _create_v3_indexes(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -516,7 +704,7 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
                     (vacancy_id, profile_slug, seen_at, seen_at),
                 )
         _create_v2_indexes(connection)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute(f"PRAGMA user_version = {_V2_SCHEMA_VERSION}")
         connection.commit()
     except Exception:
         connection.rollback()
@@ -575,6 +763,28 @@ def _create_discoveries_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_outbox_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE notification_outbox (
+            id INTEGER PRIMARY KEY,
+            vacancy_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            route TEXT NOT NULL,
+            profile_slug TEXT,
+            created_at TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
+            next_attempt_at TEXT,
+            delivered_at TEXT,
+            last_error TEXT,
+            UNIQUE (vacancy_id, event_type),
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
 def _create_v2_indexes(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX idx_vacancies_source ON vacancies (source)")
     connection.execute(
@@ -587,6 +797,18 @@ def _create_v2_indexes(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_v3_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE INDEX idx_notification_outbox_pending
+        ON notification_outbox (delivered_at, next_attempt_at, created_at, id)
+        """
+    )
+    connection.execute(
+        "CREATE INDEX idx_notification_outbox_vacancy_id ON notification_outbox (vacancy_id)"
+    )
+
+
 def _validate_v2_schema(connection: sqlite3.Connection) -> None:
     vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
     discovery_columns = _table_columns(connection, DISCOVERIES_TABLE)
@@ -594,6 +816,26 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
         discovery_columns
     ):
         raise RuntimeError("Existing database is marked schema v2 but does not match the canonical v2 schema")
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Adds an empty transactional outbox without inventing historical notifications."""
+    try:
+        connection.execute("BEGIN")
+        _create_outbox_table(connection)
+        _create_v3_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _validate_v3_schema(connection: sqlite3.Connection) -> None:
+    _validate_v2_schema(connection)
+    outbox_columns = _table_columns(connection, OUTBOX_TABLE)
+    if not _OUTBOX_COLUMNS.issubset(outbox_columns):
+        raise RuntimeError("Existing database is marked schema v3 but does not match the notification outbox schema")
 
 
 def vacancy_identity_key(vacancy: Vacancy) -> str:
@@ -686,6 +928,22 @@ def row_to_vacancy(
     )
 
 
+def _row_to_outbox_event(row: Mapping[str, Any]) -> NotificationOutboxEvent:
+    return NotificationOutboxEvent(
+        id=row["id"],
+        vacancy_id=row["vacancy_id"],
+        event_type=row["event_type"],
+        route=row["route"],
+        profile_slug=row["profile_slug"],
+        created_at=_parse_datetime(row["created_at"]),
+        attempt_count=row["attempt_count"],
+        last_attempt_at=_parse_optional_datetime(row["last_attempt_at"]),
+        next_attempt_at=_parse_optional_datetime(row["next_attempt_at"]),
+        delivered_at=_parse_optional_datetime(row["delivered_at"]),
+        last_error=row["last_error"],
+    )
+
+
 def _v1_row_to_vacancy(row: Mapping[str, Any]) -> Vacancy:
     return row_to_vacancy(row, discovery_profiles=_profiles_from_v1_row(row))
 
@@ -775,3 +1033,13 @@ def _parse_date_or_datetime(value: str | None) -> date | datetime | None:
 def _parse_datetime(value: str) -> datetime:
     normalized_value = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
     return datetime.fromisoformat(normalized_value)
+
+
+def _parse_optional_datetime(value: str | None) -> datetime | None:
+    return _parse_datetime(value) if value is not None else None
+
+
+def _safe_outbox_error(error: str) -> str:
+    """Stores concise diagnostics without allowing unbounded or multiline data."""
+    normalized = " ".join(str(error).split())
+    return normalized[:500] or "notification delivery failed"

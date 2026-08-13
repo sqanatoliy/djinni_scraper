@@ -6,6 +6,9 @@ from scrapy.utils.log import configure_logging
 
 BOT_NAME = "djinni_scraper"
 VACANCY_DB_PATH = config("DB_PATH", default="runtime/vacancies.db")
+TELEGRAM_TIMEOUT_SECONDS = config("TELEGRAM_TIMEOUT_SECONDS", default=20, cast=int)
+TELEGRAM_RETRY_DELAY_SECONDS = config("TELEGRAM_RETRY_DELAY_SECONDS", default=900, cast=int)
+NOTIFICATION_OUTBOX_BATCH_SIZE = config("NOTIFICATION_OUTBOX_BATCH_SIZE", default=25, cast=int)
 
 SPIDER_MODULES = ["djinni_scraper.spiders"]
 NEWSPIDER_MODULE = "djinni_scraper.spiders"

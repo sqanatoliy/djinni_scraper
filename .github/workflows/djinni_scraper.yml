@@ -56,6 +56,8 @@ jobs:
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
         scrapy crawl djinni -a profile=python
 
@@ -66,6 +68,8 @@ jobs:
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
         scrapy crawl djinni -a profile=data_engineer
 
@@ -74,8 +78,10 @@ jobs:
         DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
-        TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
-        CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
         scrapy crawl djinni -a profile=other
 
@@ -84,8 +90,10 @@ jobs:
         DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
-        TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
-        CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
         scrapy crawl djinni -a profile=support
 
@@ -110,10 +118,14 @@ jobs:
                 vacancies_table = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vacancies';"
                 ).fetchone()
+                outbox_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox';"
+                ).fetchone()
                 is_valid = (
                     quick_check == ("ok",)
-                    and schema_version == (1,)
+                    and schema_version == (3,)
                     and vacancies_table == (1,)
+                    and outbox_table == (1,)
                 )
         except (OSError, sqlite3.Error):
             pass

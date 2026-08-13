@@ -9,7 +9,6 @@ from djinni_scraper.items import DjinniScraperItem
 from djinni_scraper.parsers.djinni_jsonld import find_job_posting, parse_detail_metadata
 from djinni_scraper.pipelines import SQLitePipeline
 from djinni_scraper.spiders.djinni import DjinniSelectors, DjinniSpider
-from djinni_scraper.utils.telegram_utils import Telegram
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "djinni"
@@ -251,7 +250,7 @@ def test_detail_without_jobposting_yields_safe_listing_item(caplog):
     assert "no valid JobPosting JSON-LD" in caplog.text
 
 
-def test_detail_parse_constructs_canonical_vacancy_without_calling_the_legacy_pipeline(monkeypatch):
+def test_detail_parse_constructs_canonical_vacancy_without_calling_the_pipeline(monkeypatch):
     calls = []
 
     def fail_if_called(*args, **kwargs):
@@ -259,7 +258,6 @@ def test_detail_parse_constructs_canonical_vacancy_without_calling_the_legacy_pi
         raise AssertionError("parse_job_detail must not invoke the legacy pipeline")
 
     monkeypatch.setattr(SQLitePipeline, "process_item", fail_if_called)
-    monkeypatch.setattr(Telegram, "send_job_to_telegram", fail_if_called)
     spider = DjinniSpider(primary_keyword="Python")
 
     item = list(spider.parse_job_detail(detail_response("job_detail_full.html"), listing_item()))[0]

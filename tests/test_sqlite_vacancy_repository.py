@@ -175,21 +175,23 @@ def create_v1_database(path: Path, vacancy: Vacancy, profiles: tuple[str, ...]) 
         connection.close()
 
 
-def test_initialization_creates_schema_v2_with_normalized_discoveries_and_foreign_keys(repository):
+def test_initialization_creates_schema_v3_with_normalized_discoveries_outbox_and_foreign_keys(repository):
     connection = repository.connection
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     vacancy_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancies)")}
     discovery_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancy_discoveries)")}
+    outbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(notification_outbox)")}
     vacancy_indexes = {row[1] for row in connection.execute("PRAGMA index_list(vacancies)")}
     discovery_foreign_keys = list(connection.execute("PRAGMA foreign_key_list(vacancy_discoveries)"))
 
-    assert {"vacancies", "vacancy_discoveries"}.issubset(tables)
+    assert {"vacancies", "vacancy_discoveries", "notification_outbox"}.issubset(tables)
     assert {"content_hash", "first_seen_at", "last_seen_at"}.issubset(vacancy_columns)
     assert "discovery_profiles_json" not in vacancy_columns
     assert _legacy_columns().isdisjoint(vacancy_columns)
     assert {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"} == discovery_columns
+    assert {"vacancy_id", "event_type", "route", "attempt_count", "next_attempt_at", "delivered_at"}.issubset(outbox_columns)
     assert {"idx_vacancies_source", "idx_vacancies_source_vacancy_id", "idx_vacancies_published_at", "idx_vacancies_last_seen_at"}.issubset(vacancy_indexes)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert discovery_foreign_keys[0][2:] == ("vacancies", "vacancy_id", "id", "NO ACTION", "CASCADE", "NONE")
 
@@ -204,18 +206,19 @@ def test_v1_database_migrates_preserving_rows_backfills_discovery_hash_and_times
     row = _vacancy_row(repository, 1)
     restored = repository.get_vacancy_by_identity_key(vacancy_identity_key(legacy))
 
-    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 3
     assert _vacancy_count(repository) == 1
     assert restored == replace(legacy, discovery_profiles=("data_engineer", "python"))
     assert row["content_hash"] == vacancy_content_hash(legacy)
     assert row["first_seen_at"] == OBSERVED_AT.isoformat()
     assert row["last_seen_at"] == OBSERVED_AT.isoformat()
     assert repository.get_discovery_profiles(1) == ("data_engineer", "python")
+    assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
     assert "discovery_profiles_json" not in {entry[1] for entry in repository.connection.execute("PRAGMA table_info(vacancies)")}
 
     repository.close()
     repository.open()
-    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 3
     assert _vacancy_count(repository) == 1
     repository.close()
 
@@ -244,11 +247,11 @@ def test_failed_v1_migration_rolls_back_table_and_user_version(tmp_path, monkeyp
 def test_unsupported_future_schema_is_rejected(tmp_path):
     db_path = tmp_path / "future.db"
     connection = sqlite3.connect(db_path)
-    connection.execute("PRAGMA user_version = 3")
+    connection.execute("PRAGMA user_version = 4")
     connection.commit()
     connection.close()
 
-    with pytest.raises(RuntimeError, match="Unsupported SQLite schema version 3"):
+    with pytest.raises(RuntimeError, match="Unsupported SQLite schema version 4"):
         SQLiteVacancyRepository(db_path).open()
 
 
