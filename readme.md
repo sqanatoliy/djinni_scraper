@@ -95,7 +95,10 @@ scrapy crawl djinni \
 ## 🕒 Автоматизований запуск
 - Скрапер автоматично запускається **щогодини** через **GitHub Actions**.
 - Canonical вакансії зберігаються у SQLite за шляхом `runtime/vacancies.db` або значенням змінної середовища `DB_PATH`.
-- Нова БД ініціалізується автоматично; historical rows зі старого `jobs.db` навмисно не мігруються.
+- Schema v2 зберігає одну logical vacancy за `source + source_vacancy_id`; за відсутнього ID застосовується fallback `source + normalized canonical URL`. Fallback row автоматично промотується, коли пізніше з'являється stable ID.
+- Search-profile provenance зберігається нормалізовано в `vacancy_discoveries`. Повторне спостереження оновлює `last_seen_at`/`last_discovered_at`; зміна canonical content оновлює current snapshot, а не створює duplicate row.
+- Restored schema v1 cache автоматично мігрує до schema v2 без видалення canonical rows. Нові БД одразу ініціалізуються як v2; historical rows зі старого `jobs.db` навмисно не мігруються.
+- До DJ-8 Telegram bridge надсилає лише `INSERTED` vacancies. `UPDATED`, unchanged і discovery-only observations не створюють нових повідомлень.
 - Runtime SQLite state не комітиться в Git. GitHub Actions використовує cache як best-effort тимчасове збереження між scheduled runs.
 - Cache може бути evicted; у такому разі наступний run створить fresh DB і раніше побачені вакансії можуть знову вважатися новими.
 - Якщо налаштовані змінні середовища у `.env_template`, нові вакансії надсилаються у Telegram-групу.

@@ -1,5 +1,5 @@
 """Persistence adapters for canonical domain objects."""
 
-from .sqlite import InsertResult, SQLiteVacancyRepository
+from .sqlite import PersistenceResult, PersistenceStatus, SQLiteVacancyRepository, VacancyDiscovery
 
-__all__ = ["InsertResult", "SQLiteVacancyRepository"]
+__all__ = ["PersistenceResult", "PersistenceStatus", "SQLiteVacancyRepository", "VacancyDiscovery"]

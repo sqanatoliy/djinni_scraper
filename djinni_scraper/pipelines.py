@@ -6,7 +6,7 @@ from itemadapter import ItemAdapter
 from scrapy.exceptions import DropItem
 
 from djinni_scraper.domain.vacancy import Vacancy
-from djinni_scraper.persistence.sqlite import SQLiteVacancyRepository
+from djinni_scraper.persistence.sqlite import PersistenceStatus, SQLiteVacancyRepository
 from djinni_scraper.utils.telegram_utils import Telegram
 
 
@@ -38,17 +38,28 @@ class SQLitePipeline:
         spider.logger.info("Canonical SQLite persistence closed")
 
     def process_item(self, item, spider):
-        vacancy = ItemAdapter(item).get("canonical_vacancy")
+        adapter = ItemAdapter(item)
+        vacancy = adapter.get("canonical_vacancy")
         if not isinstance(vacancy, Vacancy):
             raise DropItem("Canonical persistence requires item['canonical_vacancy'] to be a Vacancy")
 
         repository = self._require_repository()
-        result = repository.insert_vacancy(vacancy)
-        if not result.inserted:
-            spider.logger.info("Canonical vacancy already persisted: %s", vacancy.url)
+        result = repository.persist_observation(
+            vacancy,
+            discovery_profiles=vacancy.discovery_profiles,
+            observation_complete=adapter.get("canonical_snapshot_complete") is True,
+            observed_at=vacancy.scraped_at,
+        )
+        if result.status is not PersistenceStatus.INSERTED:
+            spider.logger.info(
+                "Canonical vacancy %s: %s (discovery_added=%s)",
+                vacancy.url,
+                result.status.value,
+                result.discovery_added,
+            )
             return item
 
-        # The insert has committed before this legacy formatter/sender bridge runs.
+        # INSERT has committed before this unchanged temporary formatter/sender bridge runs.
         Telegram(spider).send_job_to_telegram(self._legacy_telegram_data(item))
         spider.logger.info("Canonical vacancy persisted: %s", vacancy.url)
         return item

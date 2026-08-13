@@ -1,19 +1,32 @@
-"""SQLite persistence for canonical Vacancy value objects."""
+"""SQLite persistence for canonical vacancy observations.
 
+Schema v2 keeps one current canonical snapshot per logical vacancy and stores
+search-profile provenance separately.  The repository is the only layer that
+decides identity, updates, and discovery merges.
+"""
+
+from __future__ import annotations
+
+import hashlib
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequirement, Location, Vacancy
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_V1_SCHEMA_VERSION = 1
 VACANCIES_TABLE = "vacancies"
-_CANONICAL_COLUMNS = frozenset(
+DISCOVERIES_TABLE = "vacancy_discoveries"
+
+_V1_CANONICAL_COLUMNS = frozenset(
     {
         "id",
         "identity_key",
@@ -43,25 +56,75 @@ _CANONICAL_COLUMNS = frozenset(
         "raw_source_metadata_json",
     }
 )
+_V2_CANONICAL_COLUMNS = (
+    _V1_CANONICAL_COLUMNS - {"discovery_profiles_json"}
+) | {"content_hash", "first_seen_at", "last_seen_at"}
+_DISCOVERY_COLUMNS = frozenset(
+    {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"}
+)
+_CONTENT_FIELDS = (
+    "url",
+    "title",
+    "description",
+    "company",
+    "compensation",
+    "employment_type",
+    "experience_months",
+    "locations",
+    "applicant_locations",
+    "category",
+    "industry",
+    "tags",
+    "language_requirements",
+    "published_at",
+    "valid_through",
+)
+
+
+class PersistenceStatus(str, Enum):
+    """Canonical-content outcome for one observed vacancy."""
+
+    INSERTED = "INSERTED"
+    UPDATED = "UPDATED"
+    UNCHANGED = "UNCHANGED"
 
 
 @dataclass(frozen=True, slots=True)
-class InsertResult:
-    """The persistence outcome used by the temporary Telegram bridge."""
+class PersistenceResult:
+    """Result consumed by the temporary Telegram bridge and future DJ-8 code."""
 
-    inserted: bool
+    status: PersistenceStatus
     vacancy_id: int
+    discovery_added: bool
+
+    @property
+    def inserted(self) -> bool:
+        """Compatibility predicate for callers that only distinguish new rows."""
+        return self.status is PersistenceStatus.INSERTED
+
+
+@dataclass(frozen=True, slots=True)
+class VacancyDiscovery:
+    """One normalized search-profile observation for a logical vacancy."""
+
+    profile_slug: str
+    first_discovered_at: datetime
+    last_discovered_at: datetime
+
+
+class IdentityConflictError(RuntimeError):
+    """Raised when fallback URL and stable-ID rows point to different vacancies."""
 
 
 class SQLiteVacancyRepository:
-    """Small canonical SQLite boundary with idempotent schema initialization."""
+    """Transactional boundary for canonical snapshots and discovery provenance."""
 
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self.connection: sqlite3.Connection | None = None
 
     def open(self) -> None:
-        """Opens one connection and initializes the canonical schema safely."""
+        """Opens the database, enables foreign keys, and initializes or migrates schema."""
         if self.connection is not None:
             return
         if self.db_path != ":memory:":
@@ -81,60 +144,277 @@ class SQLiteVacancyRepository:
             self.connection.close()
             self.connection = None
 
-    def insert_vacancy(self, vacancy: Vacancy) -> InsertResult:
-        """Commits a canonical vacancy and reports whether it was newly persisted."""
+    def persist_observation(
+        self,
+        vacancy: Vacancy,
+        *,
+        discovery_profiles: Iterable[str] | None = None,
+        observation_complete: bool,
+        observed_at: datetime,
+    ) -> PersistenceResult:
+        """Atomically resolves identity, persists the snapshot, and records discovery.
+
+        Incomplete observations may create a new row but never overwrite the
+        canonical snapshot of an existing row.  They still update ``last_seen``
+        and discovery provenance.
+        """
         connection = self._require_connection()
+        observed_at_text = _utc_timestamp(observed_at)
+        profiles = _normalized_profiles(
+            vacancy.discovery_profiles if discovery_profiles is None else discovery_profiles
+        )
         record = vacancy_to_record(vacancy)
+
         try:
-            cursor = connection.execute(
-                """
-                INSERT INTO vacancies (
-                    identity_key, source, source_vacancy_id, url, title, description,
-                    company_name, company_url,
-                    salary_min, salary_max, salary_currency, salary_unit,
-                    employment_type, experience_months,
-                    locations_json, applicant_locations_json,
-                    category, industry, tags_json, language_requirements_json,
-                    published_at, valid_through, scraped_at,
-                    discovery_profiles_json, raw_source_metadata_json
-                ) VALUES (
-                    :identity_key, :source, :source_vacancy_id, :url, :title, :description,
-                    :company_name, :company_url,
-                    :salary_min, :salary_max, :salary_currency, :salary_unit,
-                    :employment_type, :experience_months,
-                    :locations_json, :applicant_locations_json,
-                    :category, :industry, :tags_json, :language_requirements_json,
-                    :published_at, :valid_through, :scraped_at,
-                    :discovery_profiles_json, :raw_source_metadata_json
-                ) ON CONFLICT(identity_key) DO NOTHING
-                """,
-                record,
+            connection.execute("BEGIN")
+            existing_row, promoted = self._resolve_existing_observation(connection, vacancy)
+            if existing_row is None:
+                vacancy_id = self._insert_vacancy_row(connection, record, observed_at_text)
+                status = PersistenceStatus.INSERTED
+            else:
+                vacancy_id = existing_row["id"]
+                status = PersistenceStatus.UNCHANGED
+                if promoted:
+                    self._promote_fallback_identity(connection, vacancy_id, record)
+                if observation_complete and existing_row["content_hash"] != record["content_hash"]:
+                    self._update_vacancy_row(connection, vacancy_id, record, observed_at_text)
+                    status = PersistenceStatus.UPDATED
+                else:
+                    self._touch_last_seen(connection, vacancy_id, observed_at_text)
+
+            discovery_added = self._merge_discoveries(
+                connection,
+                vacancy_id=vacancy_id,
+                profile_slugs=profiles,
+                observed_at=observed_at_text,
             )
             connection.commit()
-        except sqlite3.Error:
+        except Exception:
             connection.rollback()
             raise
 
-        if cursor.rowcount == 1:
-            return InsertResult(inserted=True, vacancy_id=cursor.lastrowid)
+        return PersistenceResult(
+            status=status,
+            vacancy_id=vacancy_id,
+            discovery_added=discovery_added,
+        )
 
-        row = connection.execute(
-            "SELECT id FROM vacancies WHERE identity_key = ?", (record["identity_key"],)
-        ).fetchone()
-        if row is None:
-            raise sqlite3.DatabaseError("Canonical vacancy insert did not return an inserted or existing row")
-        return InsertResult(inserted=False, vacancy_id=row["id"])
+    def insert_vacancy(self, vacancy: Vacancy) -> PersistenceResult:
+        """Compatibility wrapper for the former v1 repository entry point."""
+        return self.persist_observation(
+            vacancy,
+            observation_complete=True,
+            observed_at=vacancy.scraped_at,
+        )
 
     def get_vacancy(self, vacancy: Vacancy) -> Vacancy | None:
-        """Reads a vacancy back using the same temporary identity contract."""
-        return self.get_vacancy_by_identity_key(vacancy_identity_key(vacancy))
+        """Reads a vacancy by stable identity, with URL fallback when necessary."""
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM vacancies WHERE identity_key = ?", (vacancy_identity_key(vacancy),)
+        ).fetchone()
+        if row is None and vacancy.source_vacancy_id is not None:
+            row = connection.execute(
+                "SELECT * FROM vacancies WHERE identity_key = ?",
+                (_identity_key(vacancy.source, None, vacancy.url),),
+            ).fetchone()
+        return self._vacancy_from_row(row) if row else None
 
     def get_vacancy_by_identity_key(self, identity_key: str) -> Vacancy | None:
         """Reads one canonical vacancy from its internal identity key."""
         row = self._require_connection().execute(
             "SELECT * FROM vacancies WHERE identity_key = ?", (identity_key,)
         ).fetchone()
-        return row_to_vacancy(row) if row else None
+        return self._vacancy_from_row(row) if row else None
+
+    def get_discoveries(self, vacancy_id: int) -> tuple[VacancyDiscovery, ...]:
+        """Returns normalized provenance in deterministic profile order."""
+        rows = self._require_connection().execute(
+            """
+            SELECT profile_slug, first_discovered_at, last_discovered_at
+            FROM vacancy_discoveries
+            WHERE vacancy_id = ?
+            ORDER BY profile_slug
+            """,
+            (vacancy_id,),
+        )
+        return tuple(
+            VacancyDiscovery(
+                profile_slug=row["profile_slug"],
+                first_discovered_at=_parse_datetime(row["first_discovered_at"]),
+                last_discovered_at=_parse_datetime(row["last_discovered_at"]),
+            )
+            for row in rows
+        )
+
+    def get_discovery_profiles(self, vacancy_id: int) -> tuple[str, ...]:
+        """Returns profile slugs for callers that do not need timestamps."""
+        return tuple(discovery.profile_slug for discovery in self.get_discoveries(vacancy_id))
+
+    def _resolve_existing_observation(
+        self, connection: sqlite3.Connection, vacancy: Vacancy
+    ) -> tuple[sqlite3.Row | None, bool]:
+        if vacancy.source_vacancy_id is None:
+            return self._row_by_identity_key(connection, vacancy_identity_key(vacancy)), False
+
+        stable_row = self._row_by_identity_key(connection, vacancy_identity_key(vacancy))
+        fallback_row = self._row_by_identity_key(
+            connection,
+            _identity_key(vacancy.source, None, vacancy.url),
+        )
+        if stable_row is not None and fallback_row is not None and stable_row["id"] != fallback_row["id"]:
+            raise IdentityConflictError(
+                "Stable source identity and URL fallback resolve to different canonical vacancies"
+            )
+        if stable_row is not None:
+            return stable_row, False
+        if fallback_row is not None:
+            return fallback_row, True
+        return None, False
+
+    @staticmethod
+    def _row_by_identity_key(connection: sqlite3.Connection, identity_key: str) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM vacancies WHERE identity_key = ?", (identity_key,)
+        ).fetchone()
+
+    @staticmethod
+    def _insert_vacancy_row(
+        connection: sqlite3.Connection, record: Mapping[str, Any], observed_at: str
+    ) -> int:
+        cursor = connection.execute(
+            """
+            INSERT INTO vacancies (
+                identity_key, source, source_vacancy_id, url, title, description,
+                company_name, company_url,
+                salary_min, salary_max, salary_currency, salary_unit,
+                employment_type, experience_months,
+                locations_json, applicant_locations_json,
+                category, industry, tags_json, language_requirements_json,
+                published_at, valid_through, scraped_at,
+                raw_source_metadata_json, content_hash, first_seen_at, last_seen_at
+            ) VALUES (
+                :identity_key, :source, :source_vacancy_id, :url, :title, :description,
+                :company_name, :company_url,
+                :salary_min, :salary_max, :salary_currency, :salary_unit,
+                :employment_type, :experience_months,
+                :locations_json, :applicant_locations_json,
+                :category, :industry, :tags_json, :language_requirements_json,
+                :published_at, :valid_through, :scraped_at,
+                :raw_source_metadata_json, :content_hash, :first_seen_at, :last_seen_at
+            )
+            """,
+            {**record, "first_seen_at": observed_at, "last_seen_at": observed_at},
+        )
+        return cursor.lastrowid
+
+    @staticmethod
+    def _update_vacancy_row(
+        connection: sqlite3.Connection,
+        vacancy_id: int,
+        record: Mapping[str, Any],
+        observed_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE vacancies SET
+                identity_key = :identity_key,
+                source = :source,
+                source_vacancy_id = :source_vacancy_id,
+                url = :url,
+                title = :title,
+                description = :description,
+                company_name = :company_name,
+                company_url = :company_url,
+                salary_min = :salary_min,
+                salary_max = :salary_max,
+                salary_currency = :salary_currency,
+                salary_unit = :salary_unit,
+                employment_type = :employment_type,
+                experience_months = :experience_months,
+                locations_json = :locations_json,
+                applicant_locations_json = :applicant_locations_json,
+                category = :category,
+                industry = :industry,
+                tags_json = :tags_json,
+                language_requirements_json = :language_requirements_json,
+                published_at = :published_at,
+                valid_through = :valid_through,
+                scraped_at = :scraped_at,
+                raw_source_metadata_json = :raw_source_metadata_json,
+                content_hash = :content_hash,
+                last_seen_at = :last_seen_at
+            WHERE id = :vacancy_id
+            """,
+            {**record, "vacancy_id": vacancy_id, "last_seen_at": observed_at},
+        )
+
+    @staticmethod
+    def _promote_fallback_identity(
+        connection: sqlite3.Connection, vacancy_id: int, record: Mapping[str, Any]
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE vacancies
+            SET identity_key = :identity_key, source_vacancy_id = :source_vacancy_id
+            WHERE id = :vacancy_id
+            """,
+            {
+                "identity_key": record["identity_key"],
+                "source_vacancy_id": record["source_vacancy_id"],
+                "vacancy_id": vacancy_id,
+            },
+        )
+
+    @staticmethod
+    def _touch_last_seen(connection: sqlite3.Connection, vacancy_id: int, observed_at: str) -> None:
+        connection.execute(
+            "UPDATE vacancies SET last_seen_at = ? WHERE id = ?", (observed_at, vacancy_id)
+        )
+
+    @staticmethod
+    def _merge_discoveries(
+        connection: sqlite3.Connection,
+        *,
+        vacancy_id: int,
+        profile_slugs: Iterable[str],
+        observed_at: str,
+    ) -> bool:
+        discovery_added = False
+        for profile_slug in profile_slugs:
+            row = connection.execute(
+                """
+                SELECT 1 FROM vacancy_discoveries
+                WHERE vacancy_id = ? AND profile_slug = ?
+                """,
+                (vacancy_id, profile_slug),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO vacancy_discoveries (
+                        vacancy_id, profile_slug, first_discovered_at, last_discovered_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (vacancy_id, profile_slug, observed_at, observed_at),
+                )
+                discovery_added = True
+            else:
+                connection.execute(
+                    """
+                    UPDATE vacancy_discoveries
+                    SET last_discovered_at = ?
+                    WHERE vacancy_id = ? AND profile_slug = ?
+                    """,
+                    (observed_at, vacancy_id, profile_slug),
+                )
+        return discovery_added
+
+    def _vacancy_from_row(self, row: Mapping[str, Any]) -> Vacancy:
+        return row_to_vacancy(
+            row,
+            discovery_profiles=self.get_discovery_profiles(row["id"]),
+        )
 
     def _require_connection(self) -> sqlite3.Connection:
         if self.connection is None:
@@ -143,22 +423,110 @@ class SQLiteVacancyRepository:
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Creates canonical schema v1 or rejects an incompatible existing database."""
-    existing_columns = _table_columns(connection, VACANCIES_TABLE)
-    if existing_columns and not _CANONICAL_COLUMNS.issubset(existing_columns):
-        raise RuntimeError(
-            "Existing vacancies table is not canonical schema v1; reset the legacy database before use"
-        )
-
+    """Creates schema v2 or migrates a canonical v1 database in place."""
+    connection.execute("PRAGMA foreign_keys = ON")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if current_version not in (0, SCHEMA_VERSION):
-        raise RuntimeError(
-            f"Unsupported SQLite schema version {current_version}; expected {SCHEMA_VERSION}"
-        )
+    vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
 
-    connection.executescript(
+    if current_version == 0 and not vacancy_columns:
+        _create_new_v2_schema(connection)
+        return
+    if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(vacancy_columns):
+        _migrate_v1_to_v2(connection)
+        return
+    if current_version == SCHEMA_VERSION:
+        _validate_v2_schema(connection)
+        return
+    if current_version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"
+        )
+    raise RuntimeError("Existing vacancies table is not canonical schema v1 or v2")
+
+
+def _create_new_v2_schema(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN")
+        _create_vacancies_table(connection)
+        _create_discoveries_table(connection)
+        _create_v2_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Migrates v1 rows without discarding canonical state or provenance evidence."""
+    try:
+        connection.execute("BEGIN")
+        connection.execute("ALTER TABLE vacancies RENAME TO vacancies_v1")
+        v1_rows = list(connection.execute("SELECT * FROM vacancies_v1 ORDER BY id"))
+        _create_vacancies_table(connection)
+
+        discoveries_to_backfill: list[tuple[int, tuple[str, ...], str]] = []
+        for row in v1_rows:
+            vacancy = _v1_row_to_vacancy(row)
+            record = vacancy_to_record(vacancy)
+            seen_at = _utc_timestamp(_parse_datetime(row["scraped_at"]))
+            connection.execute(
+                """
+                INSERT INTO vacancies (
+                    id, identity_key, source, source_vacancy_id, url, title, description,
+                    company_name, company_url,
+                    salary_min, salary_max, salary_currency, salary_unit,
+                    employment_type, experience_months,
+                    locations_json, applicant_locations_json,
+                    category, industry, tags_json, language_requirements_json,
+                    published_at, valid_through, scraped_at,
+                    raw_source_metadata_json, content_hash, first_seen_at, last_seen_at
+                ) VALUES (
+                    :id, :identity_key, :source, :source_vacancy_id, :url, :title, :description,
+                    :company_name, :company_url,
+                    :salary_min, :salary_max, :salary_currency, :salary_unit,
+                    :employment_type, :experience_months,
+                    :locations_json, :applicant_locations_json,
+                    :category, :industry, :tags_json, :language_requirements_json,
+                    :published_at, :valid_through, :scraped_at,
+                    :raw_source_metadata_json, :content_hash, :first_seen_at, :last_seen_at
+                )
+                """,
+                {
+                    **record,
+                    "id": row["id"],
+                    "first_seen_at": seen_at,
+                    "last_seen_at": seen_at,
+                },
+            )
+            discoveries_to_backfill.append(
+                (row["id"], _profiles_from_v1_row(row), seen_at)
+            )
+
+        connection.execute("DROP TABLE vacancies_v1")
+        _create_discoveries_table(connection)
+        for vacancy_id, profiles, seen_at in discoveries_to_backfill:
+            for profile_slug in profiles:
+                connection.execute(
+                    """
+                    INSERT INTO vacancy_discoveries (
+                        vacancy_id, profile_slug, first_discovered_at, last_discovered_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (vacancy_id, profile_slug, seen_at, seen_at),
+                )
+        _create_v2_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _create_vacancies_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS vacancies (
+        CREATE TABLE vacancies (
             id INTEGER PRIMARY KEY,
             identity_key TEXT NOT NULL UNIQUE,
             source TEXT NOT NULL,
@@ -183,27 +551,77 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             published_at TEXT,
             valid_through TEXT,
             scraped_at TEXT NOT NULL,
-            discovery_profiles_json TEXT NOT NULL,
-            raw_source_metadata_json TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_vacancies_source ON vacancies (source);
-        CREATE INDEX IF NOT EXISTS idx_vacancies_published_at ON vacancies (published_at);
+            raw_source_metadata_json TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
         """
     )
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    connection.commit()
+
+
+def _create_discoveries_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE vacancy_discoveries (
+            vacancy_id INTEGER NOT NULL,
+            profile_slug TEXT NOT NULL,
+            first_discovered_at TEXT NOT NULL,
+            last_discovered_at TEXT NOT NULL,
+            PRIMARY KEY (vacancy_id, profile_slug),
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+        ) WITHOUT ROWID
+        """
+    )
+
+
+def _create_v2_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE INDEX idx_vacancies_source ON vacancies (source)")
+    connection.execute(
+        "CREATE INDEX idx_vacancies_source_vacancy_id ON vacancies (source, source_vacancy_id)"
+    )
+    connection.execute("CREATE INDEX idx_vacancies_published_at ON vacancies (published_at)")
+    connection.execute("CREATE INDEX idx_vacancies_last_seen_at ON vacancies (last_seen_at)")
+    connection.execute(
+        "CREATE INDEX idx_vacancy_discoveries_profile_slug ON vacancy_discoveries (profile_slug)"
+    )
+
+
+def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+    vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
+    discovery_columns = _table_columns(connection, DISCOVERIES_TABLE)
+    if not _V2_CANONICAL_COLUMNS.issubset(vacancy_columns) or not _DISCOVERY_COLUMNS.issubset(
+        discovery_columns
+    ):
+        raise RuntimeError("Existing database is marked schema v2 but does not match the canonical v2 schema")
 
 
 def vacancy_identity_key(vacancy: Vacancy) -> str:
-    """Temporary duplicate key: source+ID, or source+canonical URL when ID is unavailable."""
-    if vacancy.source_vacancy_id is not None:
-        return _json_dump([vacancy.source, "source_vacancy_id", vacancy.source_vacancy_id])
-    return _json_dump([vacancy.source, "url", vacancy.url])
+    """Returns stable ``source + ID`` identity or normalized URL fallback identity."""
+    return _identity_key(vacancy.source, vacancy.source_vacancy_id, vacancy.url)
+
+
+def canonical_content_projection(vacancy: Vacancy) -> dict[str, Any]:
+    """Returns deterministic source snapshot content used for change detection.
+
+    ``scraped_at``, identity, discovery provenance, persistence timestamps, and
+    raw metadata are intentionally excluded.  Djinni raw site metadata includes
+    volatile listing counters, so hashing it would create false content updates.
+    """
+    values = vacancy.to_dict()
+    projection = {field: values[field] for field in _CONTENT_FIELDS}
+    projection["url"] = _normalized_identity_url(projection["url"])
+    return projection
+
+
+def vacancy_content_hash(vacancy: Vacancy) -> str:
+    """Hashes the deterministic canonical content projection with SHA-256."""
+    serialized = _json_dump(canonical_content_projection(vacancy)).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def vacancy_to_record(vacancy: Vacancy) -> dict[str, Any]:
-    """Flattens scalar canonical values and deterministically serializes structures."""
+    """Flattens canonical values and deterministic JSON serialization for SQLite."""
     data = vacancy.to_dict()
     company = data["company"] or {}
     compensation = data["compensation"] or {}
@@ -211,7 +629,7 @@ def vacancy_to_record(vacancy: Vacancy) -> dict[str, Any]:
         "identity_key": vacancy_identity_key(vacancy),
         "source": data["source"],
         "source_vacancy_id": data["source_vacancy_id"],
-        "url": data["url"],
+        "url": _normalized_identity_url(data["url"]),
         "title": data["title"],
         "description": data["description"],
         "company_name": company.get("name"),
@@ -231,13 +649,15 @@ def vacancy_to_record(vacancy: Vacancy) -> dict[str, Any]:
         "published_at": data["published_at"],
         "valid_through": data["valid_through"],
         "scraped_at": data["scraped_at"],
-        "discovery_profiles_json": _json_dump(data["discovery_profiles"]),
         "raw_source_metadata_json": _json_dump(data["raw_source_metadata"]),
+        "content_hash": vacancy_content_hash(vacancy),
     }
 
 
-def row_to_vacancy(row: Mapping[str, Any]) -> Vacancy:
-    """Reconstructs a canonical Vacancy from one SQLite row."""
+def row_to_vacancy(
+    row: Mapping[str, Any], *, discovery_profiles: Iterable[str] = ()
+) -> Vacancy:
+    """Reconstructs a canonical Vacancy from a v2 row and normalized provenance."""
     company = _company_from_row(row)
     compensation = _compensation_from_row(row)
     return Vacancy(
@@ -261,9 +681,57 @@ def row_to_vacancy(row: Mapping[str, Any]) -> Vacancy:
         published_at=_parse_date_or_datetime(row["published_at"]),
         valid_through=_parse_date_or_datetime(row["valid_through"]),
         scraped_at=_parse_datetime(row["scraped_at"]),
-        discovery_profiles=tuple(_json_load(row["discovery_profiles_json"])),
+        discovery_profiles=tuple(discovery_profiles),
         raw_source_metadata=_json_load(row["raw_source_metadata_json"]),
     )
+
+
+def _v1_row_to_vacancy(row: Mapping[str, Any]) -> Vacancy:
+    return row_to_vacancy(row, discovery_profiles=_profiles_from_v1_row(row))
+
+
+def _profiles_from_v1_row(row: Mapping[str, Any]) -> tuple[str, ...]:
+    try:
+        raw_profiles = _json_load(row["discovery_profiles_json"])
+    except (TypeError, json.JSONDecodeError):
+        raw_profiles = ()
+    return _normalized_profiles(raw_profiles if isinstance(raw_profiles, list) else ())
+
+
+def _identity_key(source: str, source_vacancy_id: str | None, url: str) -> str:
+    if source_vacancy_id is not None:
+        return _json_dump([source, "id", source_vacancy_id])
+    return _json_dump([source, "url", _normalized_identity_url(url)])
+
+
+def _normalized_identity_url(url: str) -> str:
+    """Applies the minimal Djinni URL rules needed for fallback identity.
+
+    The adapter already emits canonical Djinni URLs.  This second normalization
+    protects repository callers from trailing slashes, fragments, query strings,
+    and obvious tracking parameters without introducing fuzzy matching.
+    """
+    parsed = urlsplit(url.strip())
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+
+
+def _normalized_profiles(profiles: Iterable[str]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                profile.strip()
+                for profile in profiles
+                if isinstance(profile, str) and profile.strip()
+            }
+        )
+    )
+
+
+def _utc_timestamp(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("observed_at must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc).isoformat()
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:

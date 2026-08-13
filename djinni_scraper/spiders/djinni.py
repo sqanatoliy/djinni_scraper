@@ -281,6 +281,9 @@ class DjinniSpider(scrapy.Spider):
         detail_metadata = parse_detail_metadata(response, logger=self.logger)
         enriched_item = DjinniScraperItem(listing_item)
         enriched_item.update(detail_metadata)
+        # A missing JobPosting leaves only listing-level fallback fields.  It is
+        # safe for a new insert, but must not replace a previously complete row.
+        enriched_item["canonical_snapshot_complete"] = detail_metadata.get("raw_jsonld") is not None
 
         self._log_detail_mismatches(listing_item, detail_metadata)
         try:

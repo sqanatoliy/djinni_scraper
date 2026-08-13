@@ -234,6 +234,7 @@ def test_detail_response_yields_one_enriched_item_while_preserving_listing_field
     assert enriched_item["source_vacancy_id"] == "842583"
     assert enriched_item["description"].startswith("Softcery builds advanced AI systems")
     assert isinstance(enriched_item["canonical_vacancy"], Vacancy)
+    assert enriched_item["canonical_snapshot_complete"] is True
     assert enriched_item["canonical_vacancy"].source == "djinni"
     assert enriched_item["canonical_vacancy"].source_vacancy_id == "842583"
 
@@ -246,6 +247,7 @@ def test_detail_without_jobposting_yields_safe_listing_item(caplog):
     assert item["title"] == "Strong Junior/ Middle AI Engineer"
     assert item["source_vacancy_id"] is None
     assert item["raw_jsonld"] is None
+    assert item["canonical_snapshot_complete"] is False
     assert "no valid JobPosting JSON-LD" in caplog.text
 
 
