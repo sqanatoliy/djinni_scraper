@@ -9,7 +9,6 @@ from scrapy.exceptions import CloseSpider
 from scrapy.http import HtmlResponse
 
 import djinni_scraper.spiders.djinni as djinni_module
-from djinni_scraper.items import DjinniScraperItem
 from djinni_scraper.spiders.djinni import DjinniSelectors, DjinniSpider, LOGIN_URL, STATE_FILE
 
 
@@ -138,7 +137,9 @@ def test_valid_state_is_reused_and_authenticated_jobs_page_is_parsed(spider, tmp
     page = FakePage(authenticated=True)
     results = asyncio.run(collect(spider.parse_jobs(make_jobs_response(page))))
 
-    assert len([result for result in results if isinstance(result, DjinniScraperItem)]) == 3
+    detail_requests = [result for result in results if result.callback == spider.parse_job_detail]
+    assert len(detail_requests) == 3
+    assert all("playwright" not in request.meta for request in detail_requests)
     assert page.closed is True
 
 

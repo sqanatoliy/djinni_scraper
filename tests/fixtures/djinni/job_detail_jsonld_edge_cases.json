@@ -1,0 +1,45 @@
+{
+  "direct": {
+    "@type": "JobPosting",
+    "title": "Direct"
+  },
+  "array": [
+    {
+      "@type": "Thing"
+    },
+    {
+      "@type": "JobPosting",
+      "title": "Array"
+    }
+  ],
+  "graph": {
+    "@graph": [
+      {
+        "@type": "Thing"
+      },
+      {
+        "@type": "JobPosting",
+        "title": "Graph"
+      }
+    ]
+  },
+  "type_list": {
+    "@type": [
+      "Thing",
+      "JobPosting"
+    ],
+    "title": "Type list"
+  },
+  "multiple": [
+    {
+      "@type": "JobPosting",
+      "identifier": 1,
+      "url": "https://djinni.co/jobs/1-other/"
+    },
+    {
+      "@type": "JobPosting",
+      "identifier": 842583,
+      "url": "https://djinni.co/jobs/842583-strong-junior-middle-ai-engineer/"
+    }
+  ]
+}

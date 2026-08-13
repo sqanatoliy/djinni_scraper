@@ -9,6 +9,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from scrapy import signals
 from scrapy.exceptions import CloseSpider
 
+from djinni_scraper.parsers.djinni_jsonld import parse_detail_metadata
 from djinni_scraper.utils.url_utils import BASE_URL, get_start_url
 from ..items import DjinniScraperItem
 
@@ -134,7 +135,7 @@ class DjinniSpider(scrapy.Spider):
 
             self.logger.info("✅ Авторизація активна.")
             for job in response.css(DjinniSelectors.JOBS_LIST_SELECTOR):
-                yield self._parse_job_card(job, response)
+                yield self._detail_request(self._parse_job_card(job, response))
             async for next_page_request in self.parse_pagination(response):
                 yield next_page_request
         finally:
@@ -218,6 +219,45 @@ class DjinniSpider(scrapy.Spider):
                 await page.close()
             except PlaywrightError as error:
                 self.logger.warning("Unable to close Djinni Playwright page cleanly: %s", error)
+
+    def _detail_request(self, listing_item):
+        """Requests public vacancy details without Playwright and retains listing context."""
+        return scrapy.Request(
+            url=listing_item["url"],
+            callback=self.parse_job_detail,
+            cb_kwargs={"listing_item": listing_item},
+            errback=self.errback_detail_request,
+        )
+
+    def parse_job_detail(self, response, listing_item):
+        """Enriches one listing item with optional public Djinni detail metadata."""
+        detail_metadata = parse_detail_metadata(response, logger=self.logger)
+        enriched_item = DjinniScraperItem(listing_item)
+        enriched_item.update(detail_metadata)
+
+        self._log_detail_mismatches(listing_item, detail_metadata)
+        yield enriched_item
+
+    def errback_detail_request(self, failure):
+        self.logger.error("Djinni vacancy detail request failed: %s", failure.getErrorMessage())
+
+    def _log_detail_mismatches(self, listing_item, detail_metadata):
+        detail_title = detail_metadata.get("detail_title")
+        if detail_title and detail_title != listing_item.get("title"):
+            self.logger.debug(
+                "Djinni title differs between listing and detail for %s: %r != %r",
+                listing_item.get("url"),
+                listing_item.get("title"),
+                detail_title,
+            )
+
+        canonical_url = detail_metadata.get("canonical_url")
+        if canonical_url and canonical_url != listing_item.get("url", "").rstrip("/"):
+            self.logger.debug(
+                "Djinni canonical URL differs from listing URL: %s != %s",
+                listing_item.get("url"),
+                canonical_url,
+            )
 
     def _parse_job_card(self, job, response) -> DjinniScraperItem:
         """Extracts the current public Djinni listing-card fields."""
