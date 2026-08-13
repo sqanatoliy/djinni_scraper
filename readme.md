@@ -81,22 +81,23 @@ scrapy crawl djinni \
 │   │   └── djinni.py
 │   └── utils
 │       ├── __init__.py
-│       ├── db_utls.py
 │       ├── telegram_utils.py
 │       └── url_utils.py
-├── jobs.json - збережені вакансії в форматі JSON
+├── runtime/vacancies.db - runtime SQLite state (не version-controlled)
 ├── readme.md
 ├── requirements.txt
 ├── scrapy.cfg
 ├── state.json - авторизований стан Playwright
 ├── .github/workflows/scraper.yml  # GitHub Actions для автоматичного запуску
 ├── .env_template  # Файл із змінними середовища для налаштування Telegram, Djinni
-└── jobs.db  # Локальна база даних SQLite
 ```
 
 ## 🕒 Автоматизований запуск
 - Скрапер автоматично запускається **щогодини** через **GitHub Actions**.
-- Зібрані вакансії зберігаються у **SQLite** базу даних (`database.sqlite`).
+- Canonical вакансії зберігаються у SQLite за шляхом `runtime/vacancies.db` або значенням змінної середовища `DB_PATH`.
+- Нова БД ініціалізується автоматично; historical rows зі старого `jobs.db` навмисно не мігруються.
+- Runtime SQLite state не комітиться в Git. GitHub Actions використовує cache як best-effort тимчасове збереження між scheduled runs.
+- Cache може бути evicted; у такому разі наступний run створить fresh DB і раніше побачені вакансії можуть знову вважатися новими.
 - Якщо налаштовані змінні середовища у `.env_template`, нові вакансії надсилаються у Telegram-групу.
 
 ---

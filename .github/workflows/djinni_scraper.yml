@@ -5,13 +5,28 @@ on:
     - cron: '15 * * * *'  # Запуск кожну годину
   workflow_dispatch:  # Можливість ручного запуску
 
+concurrency:
+  group: djinni-vacancy-crawler-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   run_scraper:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
+
+    - name: Restore canonical SQLite state
+      id: vacancy-db-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: runtime/vacancies.db
+        key: djinni-vacancies-db-v1-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          djinni-vacancies-db-v1-
 
     - name: Set up Python
       uses: actions/setup-python@v3
@@ -36,7 +51,7 @@ jobs:
 
     - name: Run Djinni scraper for PYTHON jobs
       env:
-        DB_PATH: ./jobs.db
+        DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -46,7 +61,7 @@ jobs:
 
     - name: Run Djinni scraper for DATA Engineering jobs
       env:
-        DB_PATH: ./jobs.db
+        DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -56,7 +71,7 @@ jobs:
 
     - name: Run Djinni scraper for OTHER category jobs
       env:
-        DB_PATH: ./jobs.db
+        DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
@@ -66,7 +81,7 @@ jobs:
 
     - name: Run Djinni scraper for SUPPORT jobs
       env:
-        DB_PATH: ./jobs.db
+        DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
         DJINNI_PASSWORD: ${{ secrets.DJINNI_PASSWORD }}
         TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
@@ -74,10 +89,42 @@ jobs:
       run: |
         scrapy crawl djinni -a profile=support
 
-    - name: Commit and push database changes
+    - name: Validate canonical SQLite state
+      id: vacancy-db-state
+      if: always()
+      env:
+        DB_PATH: ./runtime/vacancies.db
       run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add ./jobs.db
-        git commit -m "Update Djinni job listings" || echo "No changes to commit"
-        git push
+        python - "$DB_PATH" <<'PY'
+        import os
+        import sqlite3
+        import sys
+        from pathlib import Path
+
+        database_path = Path(sys.argv[1]).resolve()
+        is_valid = False
+        try:
+            with sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True) as connection:
+                quick_check = connection.execute("PRAGMA quick_check;").fetchone()
+                schema_version = connection.execute("PRAGMA user_version;").fetchone()
+                vacancies_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vacancies';"
+                ).fetchone()
+                is_valid = (
+                    quick_check == ("ok",)
+                    and schema_version == (1,)
+                    and vacancies_table == (1,)
+                )
+        except (OSError, sqlite3.Error):
+            pass
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"valid={'true' if is_valid else 'false'}\\n")
+        PY
+
+    - name: Save canonical SQLite state
+      if: always() && steps.vacancy-db-state.outputs.valid == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: runtime/vacancies.db
+        key: ${{ steps.vacancy-db-restore.outputs.cache-primary-key }}

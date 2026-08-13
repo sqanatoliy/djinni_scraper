@@ -5,6 +5,7 @@ from decouple import config
 from scrapy.utils.log import configure_logging
 
 BOT_NAME = "djinni_scraper"
+VACANCY_DB_PATH = config("DB_PATH", default="runtime/vacancies.db")
 
 SPIDER_MODULES = ["djinni_scraper.spiders"]
 NEWSPIDER_MODULE = "djinni_scraper.spiders"
