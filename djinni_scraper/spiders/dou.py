@@ -56,6 +56,7 @@ class DouSpider(scrapy.Spider):
     """Scrapes one typed DOU profile through public HTTP only; no browser or auth state."""
 
     name = "dou"
+    source_label = "DOU"
     allowed_domains = ["jobs.dou.ua"]
     custom_settings = {
         # Project defaults use scrapy-playwright for Djinni. DOU must never
@@ -77,7 +78,8 @@ class DouSpider(scrapy.Spider):
 
     def start_requests(self) -> Iterable[scrapy.Request]:
         self.logger.info(
-            "DOU profile=%s search_url=%s route=%s",
+            "%s profile=%s search_url=%s route=%s",
+            self.source_label,
             self.search_profile.slug,
             self.start_urls[0],
             self.notification_route,
@@ -94,10 +96,10 @@ class DouSpider(scrapy.Spider):
         """Parses an initial scoped listing and starts cookie-preserving XHR pagination."""
         if response.status != 200:
             self._fail("listing_http_error", f"DOU listing returned HTTP {response.status}")
-        if self.search_profile.query.first_job:
+        if getattr(self.search_profile.query, "first_job", False):
             cards = self._first_job_cards_or_fail(response)
             self._record_listing_page(len(cards))
-            self.logger.info("dou-first-job-listing cards=%s", len(cards))
+            self.logger.info("%s first-job-listing cards=%s", self.source_label, len(cards))
             for card in cards:
                 yield self._detail_request(self._parse_listing_card(card, response))
             # The public First Job page has no XHR endpoint. Its initial
@@ -107,7 +109,7 @@ class DouSpider(scrapy.Spider):
             return
         cards = self._listing_cards_or_fail(response.css(DouSelectors.LISTING_CONTAINER))
         self._record_listing_page(len(cards))
-        self.logger.info("dou-listing-page cards=%s", len(cards))
+        self.logger.info("%s listing-page cards=%s", self.source_label, len(cards))
         for card in cards:
             yield self._detail_request(self._parse_listing_card(card, response))
 
@@ -137,7 +139,7 @@ class DouSpider(scrapy.Spider):
         next_count = count + number
         self._increment_run_stat("dou/xhr_batches")
         self._set_run_stat("dou/xhr_count", next_count)
-        self.logger.info("dou-xhr-page num=%s last=%s count=%s", number, last, next_count)
+        self.logger.info("%s xhr-page num=%s last=%s count=%s", self.source_label, number, last, next_count)
 
         if not last and number <= 0:
             self._fail("xhr_non_progress", "DOU XHR reported no progress before its final batch")
@@ -161,7 +163,7 @@ class DouSpider(scrapy.Spider):
                     "DOU XHR reported terminal progress after an empty initial listing",
                 )
             self._set_run_stat("dou/xhr_terminal_empty", True)
-            self.logger.info("dou-xhr-terminal-empty num=%s count=%s", number, next_count)
+            self.logger.info("%s xhr-terminal-empty num=%s count=%s", self.source_label, number, next_count)
 
         if last:
             self._set_run_stat("dou/xhr_completed", True)
@@ -173,9 +175,17 @@ class DouSpider(scrapy.Spider):
         """Requires DOU detail title, description, and numeric identity before persistence."""
         if response.status != 200:
             self._fail("detail_http_error", f"DOU detail returned HTTP {response.status}")
-        canonical_url = normalize_dou_url(response.url)
-        if dou_vacancy_id_from_url(canonical_url) is None:
+        surface_url = self._surface_url_for_detail(response, listing_item=listing_item)
+        surface_vacancy_id = dou_vacancy_id_from_url(surface_url)
+        if surface_vacancy_id is None:
             self._fail("detail_identity_missing", "DOU detail URL has no numeric vacancy identity")
+        canonical_url = self._canonical_url_for_detail(
+            response,
+            surface_url=surface_url,
+            surface_vacancy_id=surface_vacancy_id,
+        )
+        if dou_vacancy_id_from_url(canonical_url) is None:
+            self._fail("detail_identity_missing", "DOU canonical detail URL has no numeric vacancy identity")
         title = _text(response.css(DouSelectors.DETAIL_TITLE).get())
         description_html = response.css(DouSelectors.DETAIL_DESCRIPTION).get()
         if title is None or description_html is None:
@@ -201,7 +211,10 @@ class DouSpider(scrapy.Spider):
                 "detail_description_html": description_html,
                 "detail_category": category,
                 "detail_filter_links": breadcrumbs,
-                "raw_dou_metadata": {"detail_url": canonical_url},
+                "raw_dou_metadata": self._detail_source_metadata(
+                    canonical_url=canonical_url,
+                    surface_url=surface_url,
+                ),
                 "canonical_snapshot_complete": True,
             }
         )
@@ -211,6 +224,32 @@ class DouSpider(scrapy.Spider):
             self._fail("detail_normalization_failed", f"DOU detail normalization failed: {error}")
         self._increment_run_stat("dou/detail_completed")
         yield enriched_item
+
+    def _canonical_url_for_detail(
+        self,
+        response: scrapy.http.Response,
+        *,
+        surface_url: str,
+        surface_vacancy_id: str,
+    ) -> str:
+        """Keeps the established DOU detail URL policy for the main DOU surface."""
+        del response, surface_vacancy_id
+        return surface_url
+
+    def _surface_url_for_detail(
+        self,
+        response: scrapy.http.Response,
+        *,
+        listing_item: DouScraperItem,
+    ) -> str:
+        """Returns the URL of the discovery surface that produced this detail request."""
+        del listing_item
+        return normalize_dou_url(response.url)
+
+    def _detail_source_metadata(self, *, canonical_url: str, surface_url: str) -> dict[str, str]:
+        """Provides source evidence excluded from canonical content hashing."""
+        del surface_url
+        return {"detail_url": canonical_url}
 
     def errback_listing(self, failure: Any):
         self._fail("listing_request_failed", f"DOU listing request failed: {failure.getErrorMessage()}")
@@ -319,7 +358,7 @@ class DouSpider(scrapy.Spider):
 
     def _fail(self, reason: str, message: str) -> None:
         self._set_run_stat("dou/infrastructure_failure", reason)
-        self.logger.error("DOU failure profile=%s stage=%s: %s", self.discovery_profile, reason, message)
+        self.logger.error("%s failure profile=%s stage=%s: %s", self.source_label, self.discovery_profile, reason, message)
         raise CloseSpider(message)
 
 

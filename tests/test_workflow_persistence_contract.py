@@ -20,6 +20,7 @@ DOU_PROFILE_STEPS = (
     ("Run DOU scraper for First Job Remote", "dou-first-job-remote"),
     ("Run DOU scraper for Support Remote 0-1", "dou-support-remote-0-1"),
 )
+DEFTECH_PROFILE_STEP = ("Run DefTech scraper for Data Engineer", "deftech-data-engineer")
 
 
 def _workflow() -> str:
@@ -107,6 +108,18 @@ def test_workflow_serializes_all_profiles_between_one_restore_and_one_validated_
         assert "CHAT_ID: ${{ secrets.CHAT_ID }}" in step
         assert "DJINNI_EMAIL" not in step
         assert "DJINNI_PASSWORD" not in step
+    name, slug = DEFTECH_PROFILE_STEP
+    step = _step_block(workflow, name)
+    profile_indices.append(workflow.index(name))
+    assert f"DB_PATH: ./{DB_PATH}" in step
+    assert f"python scripts/run_deftech_profile.py --profile {slug}" in step
+    assert "id: crawl-deftech-" in step
+    assert "if: always()" in step
+    assert "steps.crawler-prerequisites.outputs.ready == 'true'" in step
+    assert "TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}" in step
+    assert "CHAT_ID: ${{ secrets.CHAT_ID }}" in step
+    assert "DJINNI_EMAIL" not in step
+    assert "DJINNI_PASSWORD" not in step
     assert profile_indices == sorted(profile_indices)
     assert restore_index < prerequisites_index < profile_indices[0] < profile_indices[-1] < validation_index < decision_index < upload_index
     assert "scrapy crawl djinni" not in workflow
@@ -131,8 +144,10 @@ def test_workflow_validates_current_sqlite_before_upload_and_preserves_valid_par
     assert 'RESTORED: ${{ steps.vacancy-db-restore.outputs.restored }}' in decision
     assert 'DJINNI_PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}' in decision
     assert 'DOU_SUPPORT_REMOTE_0_1_SUCCESS: ${{ steps.crawl-dou-support-remote-0-1.outputs.success }}' in decision
+    assert 'DEFTECH_DATA_ENGINEER_SUCCESS: ${{ steps.crawl-deftech-data-engineer.outputs.success }}' in decision
     assert 'DJINNI_PYTHON_MUTATED: ${{ steps.crawl-python.outputs.state_mutated }}' in decision
     assert 'DOU_SUPPORT_REMOTE_0_1_MUTATED: ${{ steps.crawl-dou-support-remote-0-1.outputs.state_mutated }}' in decision
+    assert 'DEFTECH_DATA_ENGINEER_MUTATED: ${{ steps.crawl-deftech-data-engineer.outputs.state_mutated }}' in decision
     assert (
         "if: always() && steps.vacancy-db-crawl.outputs.upload == 'true' "
         "&& steps.vacancy-db-state.outputs.valid == 'true'"
@@ -152,6 +167,8 @@ def test_workflow_fails_closed_on_profile_failures_and_uses_current_actions_vers
     assert "if: always()" in enforce
     assert "exit 2" in enforce
     assert "failed_profiles" in enforce
+    assert 'DEFTECH_DATA_ENGINEER_SUCCESS: ${{ steps.crawl-deftech-data-engineer.outputs.success }}' in enforce
+    assert '"deftech-data-engineer:$DEFTECH_DATA_ENGINEER_SUCCESS"' in enforce
 
 
 def test_workflow_keeps_single_writer_concurrency_and_never_commits_sqlite_state_to_git():

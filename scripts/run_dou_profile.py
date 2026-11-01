@@ -67,18 +67,26 @@ class DouProfileOutcome:
         }
 
 
-def outcome_from_stats(profile: str, stats: Mapping[str, object]) -> DouProfileOutcome:
-    """Classifies DOU success solely from explicit source-contract stats."""
-    search_requested = stats.get("dou/search_requested") is True
-    listing_completed = stats.get("dou/listing_completed") is True
-    xhr_completed = stats.get("dou/xhr_completed") is True
-    listing_pages = int(stats.get("dou/listing_pages", 0))
-    listing_job_cards = int(stats.get("dou/listing_job_cards", 0))
-    xhr_batches = int(stats.get("dou/xhr_batches", 0))
+def outcome_from_stats(
+    profile: str,
+    stats: Mapping[str, object],
+    *,
+    stats_prefix: str = "dou",
+    source: str = "dou",
+) -> DouProfileOutcome:
+    """Classifies a public DOU-family surface from explicit source-contract stats."""
+    prefix = stats_prefix.strip().rstrip("/")
+    stat = lambda name: f"{prefix}/{name}"
+    search_requested = stats.get(stat("search_requested")) is True
+    listing_completed = stats.get(stat("listing_completed")) is True
+    xhr_completed = stats.get(stat("xhr_completed")) is True
+    listing_pages = int(stats.get(stat("listing_pages"), 0))
+    listing_job_cards = int(stats.get(stat("listing_job_cards"), 0))
+    xhr_batches = int(stats.get(stat("xhr_batches"), 0))
     items_persisted = int(stats.get("item_scraped_count", 0))
-    detail_requests = int(stats.get("dou/detail_requests", 0))
-    detail_completed = int(stats.get("dou/detail_completed", 0))
-    failure = stats.get("dou/infrastructure_failure")
+    detail_requests = int(stats.get(stat("detail_requests"), 0))
+    detail_completed = int(stats.get(stat("detail_completed"), 0))
+    failure = stats.get(stat("infrastructure_failure"))
     spider_exceptions = any(str(key).startswith("spider_exceptions/") for key in stats)
 
     if failure:
@@ -96,7 +104,7 @@ def outcome_from_stats(profile: str, stats: Mapping[str, object]) -> DouProfileO
 
     exit_code = ExitCode.SUCCESS if category == "success" else ExitCode.INFRASTRUCTURE_FAILURE
     return DouProfileOutcome(
-        source="dou",
+        source=source,
         profile=profile,
         exit_code=int(exit_code),
         success=exit_code is ExitCode.SUCCESS,

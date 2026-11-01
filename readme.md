@@ -37,6 +37,14 @@ python scripts/run_dou_profile.py --profile dou-support-remote-0-1
 
 DOU runner працює через plain Scrapy HTTP: без Playwright, browser state, Djinni credentials або окремих Telegram secrets. Він вважає profile успішним лише після terminal listing/pagination contract і обробки всіх запитаних detail pages; валідний zero-result пошук також є успішним.
 
+DefTech — окрема DOU discovery surface, а не canonical source. Початковий profile запускається так:
+
+```bash
+python scripts/run_deftech_profile.py --profile deftech-data-engineer
+```
+
+Він працює через plain Scrapy HTTP, зберігає `source="dou"` і numeric DOU vacancy ID, а DefTech provenance фіксує в `vacancy_discoveries`. Detail canonical link стабілізує URL на `jobs.dou.ua`, тому DefTech і regular DOU не створюють duplicate vacancy, version або notification. Typed model уже підтримує майбутні `category`, `exp`, `city`, `remote`, `search` і `descr` profiles без зміни spider.
+
 ## Ad-hoc запуск
 
 ```bash
@@ -103,7 +111,7 @@ Routes `main` і `alternate` отримують credentials лише з environm
 s3://$R2_BUCKET_NAME/production/vacancies.db
 ```
 
-Hourly workflow `Run Job Scrapers Hourly` виконує `restore → Djinni profiles → six DOU profiles → validate → persist` в одному job та з одним local SQLite file. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 5 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state; failure будь-якого profile робить workflow failed, хоча валідний partial DB може бути safely uploaded за чинною mutation policy.
+Hourly workflow `Run Job Scrapers Hourly` виконує `restore → Djinni profiles → six DOU profiles → DefTech Data Engineer → validate → persist` в одному job та з одним local SQLite file. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 5 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state; failure будь-якого profile робить workflow failed, хоча валідний partial DB може бути safely uploaded за чинною mutation policy.
 
 Для workflow потрібні лише names secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT_URL`, `R2_BUCKET_NAME`. Значення не зберігаються в repository або документації.
 
