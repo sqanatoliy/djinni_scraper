@@ -1,6 +1,6 @@
 # Djinni Scraper
 
-Production-ready personal scraper вакансій Djinni. Він використовує Scrapy і Playwright для source-specific parsing, а нижче canonical boundary працює лише з `Vacancy`.
+Production-ready personal scraper вакансій Djinni і DOU. Нижче source-specific parsing canonical boundary працює лише з `Vacancy`.
 
 ## Встановлення
 
@@ -8,7 +8,7 @@ Production-ready personal scraper вакансій Djinni. Він викорис
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium
+playwright install chromium  # потрібен лише для Djinni
 ```
 
 Скопіюйте `.env_template` у локальний `.env` і задайте Djinni credentials, SQLite path та потрібні Telegram routes. Файл `.env` не відстежується Git.
@@ -23,6 +23,19 @@ scrapy crawl djinni -a profile=support
 ```
 
 Формальні profiles централізовано визначають Djinni filters, discovery provenance і logical notification route.
+
+DOU має окремі typed profiles і source-aware runner:
+
+```bash
+python scripts/run_dou_profile.py --profile dou-python-0-1
+python scripts/run_dou_profile.py --profile dou-python-1-3
+python scripts/run_dou_profile.py --profile dou-data-engineer-0-1
+python scripts/run_dou_profile.py --profile dou-data-engineer-1-3
+python scripts/run_dou_profile.py --profile dou-first-job-remote
+python scripts/run_dou_profile.py --profile dou-support-remote-0-1
+```
+
+DOU runner працює через plain Scrapy HTTP: без Playwright, browser state, Djinni credentials або окремих Telegram secrets. Він вважає profile успішним лише після terminal listing/pagination contract і обробки всіх запитаних detail pages; валідний zero-result пошук також є успішним.
 
 ## Ad-hoc запуск
 
@@ -40,16 +53,21 @@ scrapy crawl djinni \
 ## Архітектура
 
 ```text
-Djinni HTML / JSON-LD
-→ DjinniScraperItem (source DTO)
-→ normalize_djinni_vacancy()
+Djinni HTML / JSON-LD → DjinniScraperItem → normalize_djinni_vacancy()
+DOU public HTML / XHR → DouScraperItem → normalize_dou_vacancy()
 → canonical Vacancy
 → SQLite identity / updates / discoveries
 → transactional outbox
 → Telegram
 ```
 
-`DjinniScraperItem` зберігає тільки Djinni-specific transport data. `Vacancy` — незалежна від Scrapy, SQLite та Telegram domain model.
+Source DTO зберігають лише source-specific transport evidence. `Vacancy` — незалежна від Scrapy, SQLite та Telegram domain model. DOU identity — `source="dou"` разом з numeric segment після `/vacancies/`; query, fragment і trailing slash не впливають на canonical URL.
+
+## DOU transport contract
+
+Standard vacancy listings use narrowed selector `#vacancyListId ul.lt > li.l-vacancy`. Їхня DOU pagination зберігає Scrapy cookie jar: listing page exposes `window.CSRF_TOKEN` and `window.XHR_VS_URL`, then `FormRequest` sends `csrfmiddlewaretoken` and actual parsed-card `count`. JSON response is validated as `html`, `num`, `last`; `count` advances by `num`, and a non-final zero-progress response fails the profile. `first-job` має окремий terminal HTML contract `div.first-job-vacancies > ul > li.l-vacancy`: він не виконує XHR і не вимагає CSRF.
+
+Detail HTML is required for a complete DOU observation: title and description container must be present. Salary and explicit cities are parsed conservatively; remote markers never become a city, and search `exp` is discovery evidence rather than actual `experience_months`. Existing SQLite schema v5 creates versions, publications, discoveries and outbox events automatically for canonical DOU observations.
 
 ## Відновлення Djinni сесії
 
@@ -85,7 +103,7 @@ Routes `main` і `alternate` отримують credentials лише з environm
 s3://$R2_BUCKET_NAME/production/vacancies.db
 ```
 
-Hourly workflow виконує `restore → crawl → validate → persist`. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 5 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state.
+Hourly workflow `Run Job Scrapers Hourly` виконує `restore → Djinni profiles → six DOU profiles → validate → persist` в одному job та з одним local SQLite file. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 5 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state; failure будь-якого profile робить workflow failed, хоча валідний partial DB може бути safely uploaded за чинною mutation policy.
 
 Для workflow потрібні лише names secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT_URL`, `R2_BUCKET_NAME`. Значення не зберігаються в repository або документації.
 

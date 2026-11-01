@@ -1025,6 +1025,20 @@ def test_republished_formatter_adds_compact_event_context_without_changing_inser
     assert "2026\\-08\\-15" in republished
 
 
+def test_canonical_formatter_selects_the_dou_source_label_without_a_second_formatter():
+    message = format_vacancy_notification(
+        vacancy(
+            source="dou",
+            source_vacancy_id="346075",
+            url="https://jobs.dou.ua/companies/acme/vacancies/346075",
+        )
+    )
+
+    assert "*DOU\\.UA*" in message
+    assert "DJINNI" not in message
+    assert "[Відкрити вакансію](https://jobs.dou.ua/companies/acme/vacancies/346075)" in message
+
+
 @pytest.mark.parametrize(
     ("compensation", "expected"),
     [

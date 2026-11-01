@@ -8,7 +8,7 @@ import pytest
 from scrapy.exceptions import DropItem
 
 from djinni_scraper.domain.vacancy import Vacancy
-from djinni_scraper.items import DjinniScraperItem
+from djinni_scraper.items import DjinniScraperItem, DouScraperItem
 from djinni_scraper.notifications.dispatcher import NotificationDispatchResult, NotificationDispatcher
 from djinni_scraper.notifications.routing import TelegramDestination, TelegramRouteResolver
 from djinni_scraper.pipelines import SQLitePipeline
@@ -137,6 +137,60 @@ def test_pipeline_enqueues_and_formats_a_republished_publication(opened_pipeline
     assert events[1][0] == "VACANCY_REPUBLISHED"
     assert len(telegram_client.calls) == 2
     assert "Повторно опублікована вакансія" in telegram_client.calls[1][1]
+
+
+def test_dou_uses_the_existing_pipeline_for_versions_publications_discoveries_and_outbox(opened_pipeline):
+    pipeline, spider, _telegram_client = opened_pipeline
+    spider.discovery_profile = "dou-data-engineer-0-1"
+    vacancy = canonical_vacancy(
+        source="dou",
+        source_vacancy_id="346075",
+        url="https://jobs.dou.ua/companies/acme/vacancies/346075",
+        title="Junior Data Engineer",
+        description="<p>Complete DOU detail</p>",
+        published_at=date(2026, 8, 12),
+        discovery_profiles=("dou-data-engineer-0-1",),
+        raw_source_metadata={"detail": {"date_text": "12 серпня 2026"}},
+    )
+    item = DouScraperItem(canonical_vacancy=vacancy, canonical_snapshot_complete=True)
+
+    pipeline.process_item(item, spider)
+    connection = pipeline.repository.connection
+    assert connection.execute("SELECT COUNT(*) FROM vacancies WHERE source = 'dou'").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_versions").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
+
+    pipeline.process_item(item, spider)
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_versions").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
+
+    repost = replace(vacancy, published_at=date(2026, 8, 15), scraped_at=OBSERVED_AT.replace(hour=10))
+    pipeline.process_item(
+        DouScraperItem(canonical_vacancy=repost, canonical_snapshot_complete=True),
+        spider,
+    )
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 2
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_versions").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'VACANCY_REPUBLISHED'").fetchone()[0] == 1
+
+    updated = replace(repost, description="<p>Changed DOU detail</p>", scraped_at=OBSERVED_AT.replace(hour=11))
+    pipeline.process_item(
+        DouScraperItem(canonical_vacancy=updated, canonical_snapshot_complete=True),
+        spider,
+    )
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_versions").fetchone()[0] == 2
+    assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 2
+
+    spider.discovery_profile = "dou-python-0-1"
+    rediscovered = replace(updated, discovery_profiles=("dou-python-0-1",))
+    pipeline.process_item(
+        DouScraperItem(canonical_vacancy=rediscovered, canonical_snapshot_complete=True),
+        spider,
+    )
+    assert connection.execute("SELECT COUNT(*) FROM vacancies WHERE source = 'dou'").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 2
 
 
 def test_telegram_failure_keeps_event_pending_without_rolling_back_vacancy(opened_pipeline):

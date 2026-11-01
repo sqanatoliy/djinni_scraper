@@ -1,4 +1,4 @@
-"""Djinni-only Scrapy transport object used before canonical normalization."""
+"""Source-specific Scrapy transport objects used before canonical normalization."""
 
 import scrapy
 
@@ -34,5 +34,32 @@ class DjinniScraperItem(scrapy.Item):
     description = scrapy.Field()
     raw_jsonld = scrapy.Field()
     raw_djinni_metadata = scrapy.Field()
+    canonical_vacancy = scrapy.Field()
+    canonical_snapshot_complete = scrapy.Field()
+
+
+class DouScraperItem(scrapy.Item):
+    """DOU transport evidence retained until canonical normalization completes."""
+
+    title = scrapy.Field()
+    url = scrapy.Field()
+    source_vacancy_id = scrapy.Field()
+    company = scrapy.Field()
+    company_url = scrapy.Field()
+    listing_date_text = scrapy.Field()
+    listing_salary_text = scrapy.Field()
+    listing_locations_text = scrapy.Field()
+    listing_description = scrapy.Field()
+    listing_category = scrapy.Field()
+    listing_profile = scrapy.Field()
+    detail_title = scrapy.Field()
+    detail_date_text = scrapy.Field()
+    detail_salary_text = scrapy.Field()
+    detail_locations_text = scrapy.Field()
+    detail_description_html = scrapy.Field()
+    detail_category = scrapy.Field()
+    detail_filter_links = scrapy.Field()
+    canonical_url = scrapy.Field()
+    raw_dou_metadata = scrapy.Field()
     canonical_vacancy = scrapy.Field()
     canonical_snapshot_complete = scrapy.Field()

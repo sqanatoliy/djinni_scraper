@@ -3,7 +3,7 @@
 import ast
 from pathlib import Path
 
-from djinni_scraper.items import DjinniScraperItem
+from djinni_scraper.items import DjinniScraperItem, DouScraperItem
 
 
 ROOT = Path(__file__).parents[1] / "djinni_scraper"
@@ -55,6 +55,33 @@ def test_source_dto_contains_only_current_parser_to_adapter_fields():
         "description",
         "raw_jsonld",
         "raw_djinni_metadata",
+        "canonical_vacancy",
+        "canonical_snapshot_complete",
+    }
+
+
+def test_dou_source_dto_contains_only_dou_parser_to_adapter_evidence():
+    assert set(DouScraperItem.fields) == {
+        "title",
+        "url",
+        "source_vacancy_id",
+        "company",
+        "company_url",
+        "listing_date_text",
+        "listing_salary_text",
+        "listing_locations_text",
+        "listing_description",
+        "listing_category",
+        "listing_profile",
+        "detail_title",
+        "detail_date_text",
+        "detail_salary_text",
+        "detail_locations_text",
+        "detail_description_html",
+        "detail_category",
+        "detail_filter_links",
+        "canonical_url",
+        "raw_dou_metadata",
         "canonical_vacancy",
         "canonical_snapshot_complete",
     }

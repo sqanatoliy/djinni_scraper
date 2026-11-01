@@ -73,6 +73,12 @@ ROBOTSTXT_OBEY = False
 # Set settings whose default value is deprecated to a future-proof value
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
+# This application persists canonical observations through SQLitePipeline and
+# does not configure Scrapy feed exports. Disable the unused exporter so a
+# Python build without optional ``_lzma`` support can still start a crawler.
+EXTENSIONS = {
+    "scrapy.extensions.feedexport.FeedExporter": None,
+}
 
 # === Logging Settings ===
 LOG_LEVEL = "INFO"

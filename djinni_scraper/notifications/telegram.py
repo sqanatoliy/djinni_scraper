@@ -20,6 +20,7 @@ _MARKDOWN_V2_CHARS = r"_*[]()~`>#+-=|{}.!\\"
 _DESCRIPTION_LIMIT = 1_500
 _FIELD_LIMIT = 500
 _MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
+_SOURCE_LABELS = {"djinni": "DJINNI.CO", "dou": "DOU.UA"}
 
 
 class TelegramDeliveryError(RuntimeError):
@@ -51,7 +52,12 @@ def format_vacancy_notification(
     lines = []
     if event_type == "VACANCY_REPUBLISHED":
         lines.append("🔄 *Повторно опублікована вакансія*")
-    lines.extend(["*DJINNI\\.CO*", f"*{escape_markdown_v2(_clip(vacancy.title, _FIELD_LIMIT))}*"])
+    lines.extend(
+        [
+            f"*{escape_markdown_v2(_source_label(vacancy.source))}*",
+            f"*{escape_markdown_v2(_clip(vacancy.title, _FIELD_LIMIT))}*",
+        ]
+    )
     _append_field(lines, "Компанія", _company_text(vacancy))
     _append_field(lines, "Винагорода", _compensation_text(vacancy.compensation))
     _append_field(lines, "Досвід", _experience_text(vacancy.experience_months))
@@ -143,6 +149,12 @@ def _valid_retry_after(value: object) -> int | None:
 def _append_field(lines: list[str], label: str, value: str | None) -> None:
     if value:
         lines.append(f"*{escape_markdown_v2(label)}:* {escape_markdown_v2(_clip(value, _FIELD_LIMIT))}")
+
+
+def _source_label(source: str) -> str:
+    """Uses known public labels and a safe fallback for future source adapters."""
+    normalized = source.strip().casefold() if isinstance(source, str) else ""
+    return _SOURCE_LABELS.get(normalized, normalized.upper() or "JOB SOURCE")
 
 
 def _company_text(vacancy: Vacancy) -> str | None:

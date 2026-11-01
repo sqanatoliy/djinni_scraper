@@ -1,4 +1,4 @@
-name: Run Djinni Scraper Hourly
+name: Run Job Scrapers Hourly
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:  # Можливість ручного запуску
 
 concurrency:
-  group: djinni-vacancy-crawler-${{ github.ref }}
+  group: job-vacancy-crawler-${{ github.ref }}
   cancel-in-progress: false
   queue: max
 
@@ -162,6 +162,78 @@ jobs:
       run: |
         python scripts/run_djinni_profile.py --profile support
 
+    - name: Run DOU scraper for Python 0-1
+      id: crawl-dou-python-0-1
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
+      env:
+        DB_PATH: ./runtime/vacancies.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        python scripts/run_dou_profile.py --profile dou-python-0-1
+
+    - name: Run DOU scraper for Python 1-3
+      id: crawl-dou-python-1-3
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
+      env:
+        DB_PATH: ./runtime/vacancies.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        python scripts/run_dou_profile.py --profile dou-python-1-3
+
+    - name: Run DOU scraper for Data Engineer 0-1
+      id: crawl-dou-data-engineer-0-1
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
+      env:
+        DB_PATH: ./runtime/vacancies.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        python scripts/run_dou_profile.py --profile dou-data-engineer-0-1
+
+    - name: Run DOU scraper for Data Engineer 1-3
+      id: crawl-dou-data-engineer-1-3
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
+      env:
+        DB_PATH: ./runtime/vacancies.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        python scripts/run_dou_profile.py --profile dou-data-engineer-1-3
+
+    - name: Run DOU scraper for First Job Remote
+      id: crawl-dou-first-job-remote
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
+      env:
+        DB_PATH: ./runtime/vacancies.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        python scripts/run_dou_profile.py --profile dou-first-job-remote
+
+    - name: Run DOU scraper for Support Remote 0-1
+      id: crawl-dou-support-remote-0-1
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
+      env:
+        DB_PATH: ./runtime/vacancies.db
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
+        NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
+      run: |
+        python scripts/run_dou_profile.py --profile dou-support-remote-0-1
+
     - name: Validate canonical SQLite state
       id: vacancy-db-state
       if: always()
@@ -180,24 +252,46 @@ jobs:
       if: always()
       env:
         RESTORED: ${{ steps.vacancy-db-restore.outputs.restored }}
-        PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}
-        DATA_ENGINEER_SUCCESS: ${{ steps.crawl-data-engineer.outputs.success }}
-        OTHER_SUCCESS: ${{ steps.crawl-other.outputs.success }}
-        SUPPORT_SUCCESS: ${{ steps.crawl-support.outputs.success }}
-        PYTHON_MUTATED: ${{ steps.crawl-python.outputs.state_mutated }}
-        DATA_ENGINEER_MUTATED: ${{ steps.crawl-data-engineer.outputs.state_mutated }}
-        OTHER_MUTATED: ${{ steps.crawl-other.outputs.state_mutated }}
-        SUPPORT_MUTATED: ${{ steps.crawl-support.outputs.state_mutated }}
+        DJINNI_PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}
+        DJINNI_DATA_ENGINEER_SUCCESS: ${{ steps.crawl-data-engineer.outputs.success }}
+        DJINNI_OTHER_SUCCESS: ${{ steps.crawl-other.outputs.success }}
+        DJINNI_SUPPORT_SUCCESS: ${{ steps.crawl-support.outputs.success }}
+        DOU_PYTHON_0_1_SUCCESS: ${{ steps.crawl-dou-python-0-1.outputs.success }}
+        DOU_PYTHON_1_3_SUCCESS: ${{ steps.crawl-dou-python-1-3.outputs.success }}
+        DOU_DATA_ENGINEER_0_1_SUCCESS: ${{ steps.crawl-dou-data-engineer-0-1.outputs.success }}
+        DOU_DATA_ENGINEER_1_3_SUCCESS: ${{ steps.crawl-dou-data-engineer-1-3.outputs.success }}
+        DOU_FIRST_JOB_REMOTE_SUCCESS: ${{ steps.crawl-dou-first-job-remote.outputs.success }}
+        DOU_SUPPORT_REMOTE_0_1_SUCCESS: ${{ steps.crawl-dou-support-remote-0-1.outputs.success }}
+        DJINNI_PYTHON_MUTATED: ${{ steps.crawl-python.outputs.state_mutated }}
+        DJINNI_DATA_ENGINEER_MUTATED: ${{ steps.crawl-data-engineer.outputs.state_mutated }}
+        DJINNI_OTHER_MUTATED: ${{ steps.crawl-other.outputs.state_mutated }}
+        DJINNI_SUPPORT_MUTATED: ${{ steps.crawl-support.outputs.state_mutated }}
+        DOU_PYTHON_0_1_MUTATED: ${{ steps.crawl-dou-python-0-1.outputs.state_mutated }}
+        DOU_PYTHON_1_3_MUTATED: ${{ steps.crawl-dou-python-1-3.outputs.state_mutated }}
+        DOU_DATA_ENGINEER_0_1_MUTATED: ${{ steps.crawl-dou-data-engineer-0-1.outputs.state_mutated }}
+        DOU_DATA_ENGINEER_1_3_MUTATED: ${{ steps.crawl-dou-data-engineer-1-3.outputs.state_mutated }}
+        DOU_FIRST_JOB_REMOTE_MUTATED: ${{ steps.crawl-dou-first-job-remote.outputs.state_mutated }}
+        DOU_SUPPORT_REMOTE_0_1_MUTATED: ${{ steps.crawl-dou-support-remote-0-1.outputs.state_mutated }}
       run: |
         set -euo pipefail
         successful_profiles=0
         mutated_profiles=0
-        for outcome in "$PYTHON_SUCCESS" "$DATA_ENGINEER_SUCCESS" "$OTHER_SUCCESS" "$SUPPORT_SUCCESS"; do
+        for outcome in \
+          "$DJINNI_PYTHON_SUCCESS" "$DJINNI_DATA_ENGINEER_SUCCESS" \
+          "$DJINNI_OTHER_SUCCESS" "$DJINNI_SUPPORT_SUCCESS" \
+          "$DOU_PYTHON_0_1_SUCCESS" "$DOU_PYTHON_1_3_SUCCESS" \
+          "$DOU_DATA_ENGINEER_0_1_SUCCESS" "$DOU_DATA_ENGINEER_1_3_SUCCESS" \
+          "$DOU_FIRST_JOB_REMOTE_SUCCESS" "$DOU_SUPPORT_REMOTE_0_1_SUCCESS"; do
           if [[ "$outcome" == "true" ]]; then
             successful_profiles=$((successful_profiles + 1))
           fi
         done
-        for mutation in "$PYTHON_MUTATED" "$DATA_ENGINEER_MUTATED" "$OTHER_MUTATED" "$SUPPORT_MUTATED"; do
+        for mutation in \
+          "$DJINNI_PYTHON_MUTATED" "$DJINNI_DATA_ENGINEER_MUTATED" \
+          "$DJINNI_OTHER_MUTATED" "$DJINNI_SUPPORT_MUTATED" \
+          "$DOU_PYTHON_0_1_MUTATED" "$DOU_PYTHON_1_3_MUTATED" \
+          "$DOU_DATA_ENGINEER_0_1_MUTATED" "$DOU_DATA_ENGINEER_1_3_MUTATED" \
+          "$DOU_FIRST_JOB_REMOTE_MUTATED" "$DOU_SUPPORT_REMOTE_0_1_MUTATED"; do
           if [[ "$mutation" == "true" ]]; then
             mutated_profiles=$((mutated_profiles + 1))
           fi
@@ -232,23 +326,40 @@ jobs:
           --endpoint-url "$R2_ENDPOINT_URL" \
           --only-show-errors
 
-    - name: Fail workflow for unsuccessful Djinni profiles
+    - name: Fail workflow for unsuccessful scraper profiles
       if: always()
       env:
-        PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}
-        DATA_ENGINEER_SUCCESS: ${{ steps.crawl-data-engineer.outputs.success }}
-        OTHER_SUCCESS: ${{ steps.crawl-other.outputs.success }}
-        SUPPORT_SUCCESS: ${{ steps.crawl-support.outputs.success }}
+        DJINNI_PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}
+        DJINNI_DATA_ENGINEER_SUCCESS: ${{ steps.crawl-data-engineer.outputs.success }}
+        DJINNI_OTHER_SUCCESS: ${{ steps.crawl-other.outputs.success }}
+        DJINNI_SUPPORT_SUCCESS: ${{ steps.crawl-support.outputs.success }}
+        DOU_PYTHON_0_1_SUCCESS: ${{ steps.crawl-dou-python-0-1.outputs.success }}
+        DOU_PYTHON_1_3_SUCCESS: ${{ steps.crawl-dou-python-1-3.outputs.success }}
+        DOU_DATA_ENGINEER_0_1_SUCCESS: ${{ steps.crawl-dou-data-engineer-0-1.outputs.success }}
+        DOU_DATA_ENGINEER_1_3_SUCCESS: ${{ steps.crawl-dou-data-engineer-1-3.outputs.success }}
+        DOU_FIRST_JOB_REMOTE_SUCCESS: ${{ steps.crawl-dou-first-job-remote.outputs.success }}
+        DOU_SUPPORT_REMOTE_0_1_SUCCESS: ${{ steps.crawl-dou-support-remote-0-1.outputs.success }}
       run: |
         set -euo pipefail
         failed_profiles=()
-        for profile in python data_engineer other support; do
-          success_var="$(echo "$profile" | tr '[:lower:]' '[:upper:]' | tr '-' '_')_SUCCESS"
-          if [[ "${!success_var}" != "true" ]]; then
+        for outcome in \
+          "djinni-python:$DJINNI_PYTHON_SUCCESS" \
+          "djinni-data-engineer:$DJINNI_DATA_ENGINEER_SUCCESS" \
+          "djinni-other:$DJINNI_OTHER_SUCCESS" \
+          "djinni-support:$DJINNI_SUPPORT_SUCCESS" \
+          "dou-python-0-1:$DOU_PYTHON_0_1_SUCCESS" \
+          "dou-python-1-3:$DOU_PYTHON_1_3_SUCCESS" \
+          "dou-data-engineer-0-1:$DOU_DATA_ENGINEER_0_1_SUCCESS" \
+          "dou-data-engineer-1-3:$DOU_DATA_ENGINEER_1_3_SUCCESS" \
+          "dou-first-job-remote:$DOU_FIRST_JOB_REMOTE_SUCCESS" \
+          "dou-support-remote-0-1:$DOU_SUPPORT_REMOTE_0_1_SUCCESS"; do
+          profile="${outcome%%:*}"
+          success="${outcome#*:}"
+          if [[ "$success" != "true" ]]; then
             failed_profiles+=("$profile")
           fi
         done
         if [[ "${#failed_profiles[@]}" -gt 0 ]]; then
-          echo "Djinni profile runner failed or did not publish a successful outcome: ${failed_profiles[*]}" >&2
+          echo "Scraper profile runner failed or did not publish a successful outcome: ${failed_profiles[*]}" >&2
           exit 2
         fi
