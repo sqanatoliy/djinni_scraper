@@ -268,6 +268,7 @@ def test_profile_start_logs_concise_query_configuration(monkeypatch, caplog):
     assert "primary_keyword=Python" in caplog.text
     assert "exp_level=no_exp,1y,2y" in caplog.text
     assert "english_level=no_english,basic,pre,intermediate" in caplog.text
+    assert "search_url=https://djinni.co/jobs/?search_type=basic-search" in caplog.text
     assert "employment=" not in caplog.text
 
 

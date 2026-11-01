@@ -352,8 +352,9 @@ class DjinniSpider(scrapy.Spider):
         if query.employment:
             query_log = f"{query_log} employment={','.join(query.employment)}"
         self.logger.info(
-            "Djinni %s notification_route=%s",
+            "Djinni %s search_url=%s notification_route=%s",
             query_log,
+            self.start_urls[0],
             self.notification_route,
         )
 
