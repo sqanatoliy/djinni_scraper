@@ -22,11 +22,13 @@ class SQLitePipeline:
         telegram_timeout_seconds: int = 20,
         telegram_retry_delay_seconds: int = 900,
         notification_outbox_batch_size: int = 25,
+        telegram_send_interval_seconds: float = 1.0,
     ):
         self.db_path = db_path
         self.telegram_timeout_seconds = telegram_timeout_seconds
         self.telegram_retry_delay_seconds = telegram_retry_delay_seconds
         self.notification_outbox_batch_size = notification_outbox_batch_size
+        self.telegram_send_interval_seconds = telegram_send_interval_seconds
         self.repository: SQLiteVacancyRepository | None = None
         self.dispatcher: NotificationDispatcher | None = None
 
@@ -37,6 +39,7 @@ class SQLitePipeline:
             telegram_timeout_seconds=crawler.settings["TELEGRAM_TIMEOUT_SECONDS"],
             telegram_retry_delay_seconds=crawler.settings["TELEGRAM_RETRY_DELAY_SECONDS"],
             notification_outbox_batch_size=crawler.settings["NOTIFICATION_OUTBOX_BATCH_SIZE"],
+            telegram_send_interval_seconds=crawler.settings["TELEGRAM_SEND_INTERVAL_SECONDS"],
         )
 
     def open_spider(self, spider):
@@ -48,6 +51,7 @@ class SQLitePipeline:
             telegram_client=TelegramClient(timeout_seconds=self.telegram_timeout_seconds),
             retry_delay_seconds=self.telegram_retry_delay_seconds,
             batch_limit=self.notification_outbox_batch_size,
+            send_interval_seconds=self.telegram_send_interval_seconds,
             logger=spider.logger,
         )
         spider.logger.info("Canonical SQLite persistence opened at %s", self.db_path)

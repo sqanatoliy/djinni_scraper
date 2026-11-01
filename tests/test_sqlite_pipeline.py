@@ -9,7 +9,7 @@ from scrapy.exceptions import DropItem
 
 from djinni_scraper.domain.vacancy import Vacancy
 from djinni_scraper.items import DjinniScraperItem
-from djinni_scraper.notifications.dispatcher import NotificationDispatcher
+from djinni_scraper.notifications.dispatcher import NotificationDispatchResult, NotificationDispatcher
 from djinni_scraper.notifications.routing import TelegramDestination, TelegramRouteResolver
 from djinni_scraper.pipelines import SQLitePipeline
 
@@ -79,6 +79,7 @@ def opened_pipeline(tmp_path):
         batch_limit=25,
         logger=spider.logger,
         now=lambda: OBSERVED_AT,
+        sleep=lambda _seconds: None,
     )
     yield pipeline, spider, telegram_client
     pipeline.close_spider(spider)
@@ -145,10 +146,10 @@ def test_telegram_failure_keeps_event_pending_without_rolling_back_vacancy(opene
     vacancy = canonical_vacancy()
 
     pipeline.process_item(parser_item(vacancy), spider)
-    delivered, failed = pipeline.dispatcher.dispatch_due()
+    dispatch_result = pipeline.dispatcher.dispatch_due()
     event = pipeline.repository.get_notification_event(1)
 
-    assert (delivered, failed) == (0, 1)
+    assert dispatch_result == NotificationDispatchResult(0, 1, rate_limited=False)
     assert pipeline.repository.get_vacancy(vacancy) == vacancy
     assert event.delivered_at is None
     assert event.attempt_count == 1
@@ -189,6 +190,7 @@ def test_pipeline_from_crawler_uses_configured_notification_settings(tmp_path):
             "TELEGRAM_TIMEOUT_SECONDS": 12,
             "TELEGRAM_RETRY_DELAY_SECONDS": 345,
             "NOTIFICATION_OUTBOX_BATCH_SIZE": 7,
+            "TELEGRAM_SEND_INTERVAL_SECONDS": 1.25,
         }
 
     pipeline = SQLitePipeline.from_crawler(FakeCrawler())
@@ -197,6 +199,7 @@ def test_pipeline_from_crawler_uses_configured_notification_settings(tmp_path):
     assert pipeline.telegram_timeout_seconds == 12
     assert pipeline.telegram_retry_delay_seconds == 345
     assert pipeline.notification_outbox_batch_size == 7
+    assert pipeline.telegram_send_interval_seconds == 1.25
 
 
 def test_pipeline_has_no_legacy_formatter_or_inline_sql_and_workflow_keeps_runtime_state_out_of_git():

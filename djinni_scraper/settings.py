@@ -1,14 +1,23 @@
 import os
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 from decouple import config
 from scrapy.utils.log import configure_logging
+
+
+def _positive_float(value: object) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError("TELEGRAM_SEND_INTERVAL_SECONDS must be a positive finite number")
+    return parsed
 
 BOT_NAME = "djinni_scraper"
 VACANCY_DB_PATH = config("DB_PATH", default="runtime/vacancies.db")
 TELEGRAM_TIMEOUT_SECONDS = config("TELEGRAM_TIMEOUT_SECONDS", default=20, cast=int)
 TELEGRAM_RETRY_DELAY_SECONDS = config("TELEGRAM_RETRY_DELAY_SECONDS", default=900, cast=int)
 NOTIFICATION_OUTBOX_BATCH_SIZE = config("NOTIFICATION_OUTBOX_BATCH_SIZE", default=25, cast=int)
+TELEGRAM_SEND_INTERVAL_SECONDS = config("TELEGRAM_SEND_INTERVAL_SECONDS", default=1.0, cast=_positive_float)
 
 SPIDER_MODULES = ["djinni_scraper.spiders"]
 NEWSPIDER_MODULE = "djinni_scraper.spiders"

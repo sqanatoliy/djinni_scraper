@@ -19,10 +19,20 @@ TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 _MARKDOWN_V2_CHARS = r"_*[]()~`>#+-=|{}.!\\"
 _DESCRIPTION_LIMIT = 1_500
 _FIELD_LIMIT = 500
+_MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
 
 
 class TelegramDeliveryError(RuntimeError):
     """A concise transport failure that is safe to persist in outbox diagnostics."""
+
+
+class TelegramRateLimitError(TelegramDeliveryError):
+    """A Telegram HTTP 429 with an optional, bounded retry hint."""
+
+    def __init__(self, retry_after_seconds: int | None) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        suffix = f"; retry_after={retry_after_seconds}s" if retry_after_seconds is not None else ""
+        super().__init__(f"Telegram rate limited request (HTTP 429{suffix})")
 
 
 def escape_markdown_v2(value: object) -> str:
@@ -93,8 +103,41 @@ class TelegramClient:
             )
         except requests.RequestException as error:
             raise TelegramDeliveryError(f"Telegram request failed: {type(error).__name__}") from error
+        if response.status_code == 429:
+            raise TelegramRateLimitError(_retry_after_seconds(response))
         if not 200 <= response.status_code < 300:
             raise TelegramDeliveryError(f"Telegram returned HTTP {response.status_code}")
+
+
+def _retry_after_seconds(response: Any) -> int | None:
+    """Reads Telegram's JSON hint before the standard HTTP header fallback."""
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        parameters = payload.get("parameters")
+        if isinstance(parameters, dict):
+            retry_after = _valid_retry_after(parameters.get("retry_after"))
+            if retry_after is not None:
+                return retry_after
+
+    headers = getattr(response, "headers", None)
+    header_value = headers.get("Retry-After") if hasattr(headers, "get") else None
+    return _valid_retry_after(header_value)
+
+
+def _valid_retry_after(value: object) -> int | None:
+    """Accepts only positive, reasonable whole-second retry hints."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        seconds = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        seconds = int(value.strip())
+    else:
+        return None
+    return seconds if 0 < seconds <= _MAX_RETRY_AFTER_SECONDS else None
 
 
 def _append_field(lines: list[str], label: str, value: str | None) -> None:

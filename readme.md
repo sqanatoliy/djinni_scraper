@@ -72,7 +72,7 @@ UNCHANGED      → без нового повідомлення
 discovery-only → без нового повідомлення
 ```
 
-Routes `main` і `alternate` отримують credentials лише з environment. Невдала delivery залишається pending із часом наступної спроби; токени й chat IDs не пишуться до SQLite або логів.
+Routes `main` і `alternate` отримують credentials лише з environment. Невдала delivery залишається pending із часом наступної спроби; токени й chat IDs не пишуться до SQLite або логів. Успішні sends розділяються `TELEGRAM_SEND_INTERVAL_SECONDS` (default `1.0`). Для Telegram HTTP 429 dispatcher бере JSON `parameters.retry_after`, потім HTTP `Retry-After`, інакше `TELEGRAM_RETRY_DELAY_SECONDS`; фіксує лише поточний event та зупиняє ordered batch без нових attempts.
 
 ## GitHub Actions state
 

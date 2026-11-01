@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequirement, Location, Vacancy
-from djinni_scraper.notifications.dispatcher import NotificationDispatcher
+from djinni_scraper.notifications.dispatcher import NotificationDispatchResult, NotificationDispatcher
 from djinni_scraper.notifications.routing import (
     NotificationConfigurationError,
     TelegramDestination,
@@ -18,6 +18,7 @@ from djinni_scraper.notifications.telegram import (
     PARSE_MODE,
     TelegramClient,
     TelegramDeliveryError,
+    TelegramRateLimitError,
     format_vacancy_notification,
 )
 from djinni_scraper.persistence import sqlite as sqlite_module
@@ -43,6 +44,18 @@ class RecordingTelegramClient:
         self.calls.append((destination, message))
         if self.error is not None:
             raise self.error
+
+
+class SequencedTelegramClient:
+    def __init__(self, outcomes: list[Exception | None]):
+        self.outcomes = outcomes
+        self.calls = []
+
+    def send(self, destination, message):
+        self.calls.append((destination, message))
+        outcome = self.outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
 
 
 def vacancy(**overrides) -> Vacancy:
@@ -92,6 +105,19 @@ def persist_new(repository, *, route="main", profile_slug="python", observed_at=
         observation_complete=True,
         observed_at=observed_at,
         notification_intent=NotificationIntent(route=route, profile_slug=profile_slug),
+    )
+
+
+def persist_distinct_new(repository, index: int, *, route="main"):
+    return repository.persist_observation(
+        vacancy(
+            source_vacancy_id=f"842583-{index}",
+            url=f"https://djinni.co/jobs/842583-role-{index}",
+            title=f"Canonical role {index}",
+        ),
+        observation_complete=True,
+        observed_at=NOW,
+        notification_intent=NotificationIntent(route=route, profile_slug="python"),
     )
 
 
@@ -485,9 +511,10 @@ def test_dispatch_success_marks_delivered_and_keeps_audit_row(repository, resolv
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: NOW,
+        sleep=lambda _seconds: None,
     )
 
-    assert dispatcher.dispatch_due() == (1, 0)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(1, 0, rate_limited=False)
     event = repository.get_notification_event(result.notification_event_id)
 
     assert len(client.calls) == 1
@@ -496,7 +523,7 @@ def test_dispatch_success_marks_delivered_and_keeps_audit_row(repository, resolv
     assert event.delivered_at == NOW
     assert event.last_error is None
     assert event.next_attempt_at is None
-    assert dispatcher.dispatch_due() == (0, 0)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 0, rate_limited=False)
 
 
 def test_incomplete_repost_uses_publication_event_date_without_degrading_snapshot(repository, resolver):
@@ -528,12 +555,13 @@ def test_incomplete_repost_uses_publication_event_date_without_degrading_snapsho
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: LATER,
+        sleep=lambda _seconds: None,
     )
 
     assert repost.status is PersistenceStatus.REPUBLISHED
     assert repost.notification_enqueued is True
     assert repository.get_vacancy_by_id(inserted.vacancy_id) == complete
-    assert dispatcher.dispatch_due() == (2, 0)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(2, 0, rate_limited=False)
     assert "🔄 *Повторно опублікована вакансія*" in client.calls[1][1]
     assert "*Опубліковано:* 2026\\-11\\-15" in client.calls[1][1]
     assert "2026\\-11\\-01" not in client.calls[1][1]
@@ -549,17 +577,238 @@ def test_dispatch_failure_is_pending_sanitized_and_not_retried_until_due(reposit
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: NOW,
+        sleep=lambda _seconds: None,
     )
 
-    assert dispatcher.dispatch_due() == (0, 1)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=False)
     event = repository.get_notification_event(result.notification_event_id)
 
     assert event.delivered_at is None
     assert event.attempt_count == 1
     assert event.next_attempt_at == LATER
     assert "super-secret" not in event.last_error
-    assert dispatcher.dispatch_due() == (0, 0)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 0, rate_limited=False)
     assert len(client.calls) == 1
+
+
+def test_rate_limit_marks_only_current_event_and_stops_ordered_batch(repository, resolver):
+    persisted = [persist_distinct_new(repository, index) for index in range(1, 5)]
+    client = SequencedTelegramClient([TelegramRateLimitError(12)])
+    sleeps = []
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: NOW,
+        sleep=sleeps.append,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=True)
+
+    first_event = repository.get_notification_event(persisted[0].notification_event_id)
+    untouched_events = [
+        repository.get_notification_event(result.notification_event_id) for result in persisted[1:]
+    ]
+    assert len(client.calls) == 1
+    assert sleeps == []
+    assert first_event.attempt_count == 1
+    assert first_event.last_attempt_at == NOW
+    assert first_event.next_attempt_at == NOW + timedelta(seconds=12)
+    assert first_event.delivered_at is None
+    assert first_event.last_error == "Telegram rate limited request (HTTP 429; retry_after=12s)"
+    assert all(event.attempt_count == 0 for event in untouched_events)
+    assert all(event.last_attempt_at is None for event in untouched_events)
+    assert all(event.next_attempt_at is None for event in untouched_events)
+
+
+def test_dispatcher_paces_successful_sends_without_sleep_after_last_event(repository, resolver):
+    [persist_distinct_new(repository, index) for index in range(1, 4)]
+    client = SequencedTelegramClient([None, None, None])
+    sleeps = []
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        send_interval_seconds=1.25,
+        now=lambda: NOW,
+        sleep=sleeps.append,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(3, 0, rate_limited=False)
+    assert len(client.calls) == 3
+    assert sleeps == [1.25, 1.25]
+
+
+def test_successes_before_rate_limit_are_delivered_and_tail_stays_untouched(repository, resolver):
+    persisted = [persist_distinct_new(repository, index) for index in range(1, 6)]
+    client = SequencedTelegramClient([None, None, TelegramRateLimitError(8)])
+    sleeps = []
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: NOW,
+        sleep=sleeps.append,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(2, 1, rate_limited=True)
+    delivered_events = [
+        repository.get_notification_event(result.notification_event_id) for result in persisted[:2]
+    ]
+    rate_limited_event = repository.get_notification_event(persisted[2].notification_event_id)
+    untouched_events = [
+        repository.get_notification_event(result.notification_event_id) for result in persisted[3:]
+    ]
+    assert len(client.calls) == 3
+    assert sleeps == [1.0, 1.0]
+    assert all(event.delivered_at == NOW for event in delivered_events)
+    assert rate_limited_event.attempt_count == 1
+    assert rate_limited_event.next_attempt_at == NOW + timedelta(seconds=8)
+    assert all(event.attempt_count == 0 for event in untouched_events)
+
+
+def test_rate_limit_after_pacing_uses_the_actual_attempt_time_for_cooldown(repository, resolver):
+    persisted = [persist_distinct_new(repository, index) for index in range(1, 5)]
+    clock = [NOW]
+
+    def advance_clock(seconds):
+        clock[0] += timedelta(seconds=seconds)
+
+    client = SequencedTelegramClient([None, None, TelegramRateLimitError(10)])
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        send_interval_seconds=3.0,
+        now=lambda: clock[0],
+        sleep=advance_clock,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(2, 1, rate_limited=True)
+    rate_limited_event = repository.get_notification_event(persisted[2].notification_event_id)
+    assert clock[0] == NOW + timedelta(seconds=6)
+    assert rate_limited_event.next_attempt_at == NOW + timedelta(seconds=16)
+
+    clock[0] = NOW + timedelta(seconds=15)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 0, rate_limited=True)
+    assert len(client.calls) == 3
+    assert repository.get_notification_event(persisted[3].notification_event_id).attempt_count == 0
+
+
+def test_same_process_redispatch_stays_blocked_after_rate_limit(repository, resolver):
+    persisted = [persist_distinct_new(repository, index) for index in range(1, 3)]
+    client = SequencedTelegramClient([TelegramRateLimitError(10)])
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: NOW,
+        sleep=lambda _seconds: None,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=True)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 0, rate_limited=True)
+    assert len(client.calls) == 1
+    assert repository.get_notification_event(persisted[1].notification_event_id).attempt_count == 0
+
+
+def test_route_cooldown_expires_and_allows_a_later_dispatch(repository, resolver):
+    persisted = [persist_distinct_new(repository, index) for index in range(1, 3)]
+    clock = [NOW]
+    client = SequencedTelegramClient([TelegramRateLimitError(10), None, None])
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: clock[0],
+        sleep=lambda _seconds: None,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=True)
+    clock[0] = NOW + timedelta(seconds=5)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 0, rate_limited=True)
+    clock[0] = NOW + timedelta(seconds=11)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(2, 0, rate_limited=False)
+
+    first_event = repository.get_notification_event(persisted[0].notification_event_id)
+    second_event = repository.get_notification_event(persisted[1].notification_event_id)
+    assert len(client.calls) == 3
+    assert first_event.attempt_count == 2
+    assert second_event.attempt_count == 1
+    assert first_event.delivered_at == clock[0]
+    assert second_event.delivered_at == clock[0]
+
+
+def test_429_without_retry_hint_uses_configured_fallback_delay(repository, resolver):
+    persisted = persist_distinct_new(repository, 1)
+    client = SequencedTelegramClient([TelegramRateLimitError(None)])
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: NOW,
+        sleep=lambda _seconds: None,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=True)
+    event = repository.get_notification_event(persisted.notification_event_id)
+    assert event.next_attempt_at == LATER
+    assert event.last_error == "Telegram rate limited request (HTTP 429)"
+
+
+def test_non_rate_limit_failure_continues_with_fixed_retry_delay(repository, resolver):
+    persisted = [persist_distinct_new(repository, index) for index in range(1, 3)]
+    client = SequencedTelegramClient([TelegramDeliveryError("Telegram returned HTTP 500"), None])
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: NOW,
+        sleep=lambda _seconds: None,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(1, 1, rate_limited=False)
+    first_event = repository.get_notification_event(persisted[0].notification_event_id)
+    second_event = repository.get_notification_event(persisted[1].notification_event_id)
+    assert len(client.calls) == 2
+    assert first_event.next_attempt_at == LATER
+    assert second_event.delivered_at == NOW
+
+
+def test_rate_limit_stops_entire_ordered_batch_before_alternate_route(repository, resolver):
+    main = persist_distinct_new(repository, 1, route="main")
+    alternate = persist_distinct_new(repository, 2, route="alternate")
+    client = SequencedTelegramClient([TelegramRateLimitError(12)])
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: NOW,
+        sleep=lambda _seconds: None,
+    )
+
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=True)
+    assert len(client.calls) == 1
+    assert repository.get_notification_event(main.notification_event_id).attempt_count == 1
+    assert repository.get_notification_event(alternate.notification_event_id).attempt_count == 0
 
 
 def test_due_failed_event_retries_in_a_later_repository_session_without_new_vacancy(tmp_path, resolver):
@@ -574,8 +823,9 @@ def test_due_failed_event_retries_in_a_later_repository_session_without_new_vaca
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: NOW,
+        sleep=lambda _seconds: None,
     )
-    assert failed_dispatcher.dispatch_due() == (0, 1)
+    assert failed_dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=False)
     first_repository.close()
 
     second_repository = SQLiteVacancyRepository(db_path)
@@ -588,9 +838,10 @@ def test_due_failed_event_retries_in_a_later_repository_session_without_new_vaca
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: LATER,
+        sleep=lambda _seconds: None,
     )
 
-    assert retry_dispatcher.dispatch_due() == (1, 0)
+    assert retry_dispatcher.dispatch_due() == NotificationDispatchResult(1, 0, rate_limited=False)
     event = second_repository.get_notification_event(result.notification_event_id)
     assert event.attempt_count == 2
     assert event.delivered_at == LATER
@@ -609,8 +860,9 @@ def test_pending_event_formats_the_current_canonical_snapshot_on_retry(repositor
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: NOW,
+        sleep=lambda _seconds: None,
     )
-    assert failed_dispatcher.dispatch_due() == (0, 1)
+    assert failed_dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=False)
 
     refreshed = replace(vacancy(), title="Refreshed canonical role", scraped_at=NOW + timedelta(minutes=1))
     update = repository.persist_observation(
@@ -627,10 +879,11 @@ def test_pending_event_formats_the_current_canonical_snapshot_on_retry(repositor
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: LATER,
+        sleep=lambda _seconds: None,
     )
 
     assert update.status is PersistenceStatus.UPDATED
-    assert retry_dispatcher.dispatch_due() == (1, 0)
+    assert retry_dispatcher.dispatch_due() == NotificationDispatchResult(1, 0, rate_limited=False)
     assert "Refreshed canonical role" in client.calls[0][1]
     assert repository.get_notification_event(result.notification_event_id).route == "main"
 
@@ -682,9 +935,10 @@ def test_unknown_route_event_stays_pending_with_safe_failure(repository, resolve
         retry_delay_seconds=900,
         batch_limit=10,
         now=lambda: NOW,
+        sleep=lambda _seconds: None,
     )
 
-    assert dispatcher.dispatch_due() == (0, 1)
+    assert dispatcher.dispatch_due() == NotificationDispatchResult(0, 1, rate_limited=False)
     event = repository.get_notification_event(result.notification_event_id)
     assert client.calls == []
     assert event.delivered_at is None
@@ -802,6 +1056,92 @@ def test_telegram_client_uses_markdown_timeout_and_handles_non_2xx_without_retry
         TelegramClient(timeout_seconds=12, post=lambda *_args, **_kwargs: FailureResponse()).send(
             TelegramDestination(token="token", chat_id="chat"), "message"
         )
+
+
+class FakeTelegramResponse:
+    def __init__(self, status_code, *, payload=None, json_error=None, headers=None):
+        self.status_code = status_code
+        self.payload = payload
+        self.json_error = json_error
+        self.headers = headers or {}
+
+    def json(self):
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+
+def test_telegram_client_extracts_rate_limit_from_json_without_secrets():
+    response = FakeTelegramResponse(
+        429,
+        payload={"ok": False, "parameters": {"retry_after": 12, "token": "response-secret"}},
+    )
+
+    with pytest.raises(TelegramRateLimitError) as error:
+        TelegramClient(timeout_seconds=12, post=lambda *_args, **_kwargs: response).send(
+            TelegramDestination(token="token-secret", chat_id="chat-secret"), "message"
+        )
+
+    assert error.value.retry_after_seconds == 12
+    assert str(error.value) == "Telegram rate limited request (HTTP 429; retry_after=12s)"
+    assert "secret" not in str(error.value)
+
+
+def test_telegram_client_extracts_rate_limit_from_http_header_when_json_is_malformed():
+    response = FakeTelegramResponse(
+        429,
+        json_error=ValueError("not JSON"),
+        headers={"Retry-After": "9"},
+    )
+
+    with pytest.raises(TelegramRateLimitError) as error:
+        TelegramClient(timeout_seconds=12, post=lambda *_args, **_kwargs: response).send(
+            TelegramDestination(token="token", chat_id="chat"), "message"
+        )
+
+    assert error.value.retry_after_seconds == 9
+
+
+def test_telegram_client_prefers_json_rate_limit_hint_over_http_header():
+    response = FakeTelegramResponse(
+        429,
+        payload={"parameters": {"retry_after": "7"}},
+        headers={"Retry-After": "15"},
+    )
+
+    with pytest.raises(TelegramRateLimitError) as error:
+        TelegramClient(timeout_seconds=12, post=lambda *_args, **_kwargs: response).send(
+            TelegramDestination(token="token", chat_id="chat"), "message"
+        )
+
+    assert error.value.retry_after_seconds == 7
+
+
+@pytest.mark.parametrize("retry_after", ["0", "-1", "invalid", "999999999", True])
+def test_telegram_client_rejects_invalid_rate_limit_hints(retry_after):
+    response = FakeTelegramResponse(
+        429,
+        payload={"parameters": {"retry_after": retry_after}},
+        headers={"Retry-After": "also-invalid"},
+    )
+
+    with pytest.raises(TelegramRateLimitError) as error:
+        TelegramClient(timeout_seconds=12, post=lambda *_args, **_kwargs: response).send(
+            TelegramDestination(token="token", chat_id="chat"), "message"
+        )
+
+    assert error.value.retry_after_seconds is None
+
+
+def test_telegram_client_keeps_non_429_4xx_as_generic_delivery_error():
+    response = FakeTelegramResponse(400, payload={"parameters": {"retry_after": 12}})
+
+    with pytest.raises(TelegramDeliveryError, match="HTTP 400") as error:
+        TelegramClient(timeout_seconds=12, post=lambda *_args, **_kwargs: response).send(
+            TelegramDestination(token="token", chat_id="chat"), "message"
+        )
+
+    assert not isinstance(error.value, TelegramRateLimitError)
 
 
 def test_telegram_client_sanitizes_request_exception_details():
