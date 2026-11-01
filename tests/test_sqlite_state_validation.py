@@ -33,7 +33,7 @@ def test_current_database_passes_pre_and_post_run_validation(tmp_path):
         text=True,
     )
     assert result.returncode == 0
-    assert "schema version 4" in result.stdout
+    assert "schema version 5" in result.stdout
 
 
 def test_supported_older_database_is_allowed_only_before_application_migration(tmp_path):
@@ -60,7 +60,7 @@ def test_unknown_schema_is_rejected_before_crawler_can_bootstrap_over_it(tmp_pat
     repository.open()
     repository.close()
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version = 5")
+    connection.execute("PRAGMA user_version = 6")
     connection.commit()
     connection.close()
 

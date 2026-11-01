@@ -204,14 +204,14 @@ def test_v2_to_v3_migration_preserves_rows_discoveries_and_does_not_backfill_not
     repo = SQLiteVacancyRepository(db_path)
     repo.open()
 
-    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert repo.connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
     assert repo.get_discovery_profiles(1) == ("python",)
     assert [publication.published_at for publication in repo.list_publications(1)] == ["2026-08-12"]
     assert repo.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
     repo.close()
     repo.open()
-    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     repo.close()
 
 
@@ -296,7 +296,7 @@ def test_v3_to_v4_migration_preserves_state_backfills_publications_and_rekeys_ou
     repo.open()
     event = repo.get_notification_event(7)
 
-    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert repo.connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
     assert repo.get_discovery_profiles(1) == ("python",)
     assert [publication.published_at for publication in repo.list_publications(1)] == ["2026-08-12"]
@@ -314,7 +314,7 @@ def test_v3_to_v4_migration_preserves_state_backfills_publications_and_rekeys_ou
 
     repo.close()
     repo.open()
-    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert repo.connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 1
     repo.close()
 

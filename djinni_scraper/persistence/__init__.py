@@ -8,6 +8,7 @@ from .sqlite import (
     SQLiteVacancyRepository,
     VacancyDiscovery,
     VacancyPublication,
+    VacancyVersion,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "SQLiteVacancyRepository",
     "VacancyDiscovery",
     "VacancyPublication",
+    "VacancyVersion",
 ]

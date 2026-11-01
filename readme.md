@@ -57,10 +57,13 @@ Djinni HTML / JSON-LD
 
 ## SQLite і сповіщення
 
-- Runtime DB: `runtime/vacancies.db` (schema version 4).
+- Runtime DB: `runtime/vacancies.db` (schema version 5).
 - Одна logical vacancy визначається через `source + source_vacancy_id`; без stable ID використовується normalized URL fallback.
 - `vacancy_discoveries` зберігає profile provenance та timestamps першого/останнього виявлення.
 - `vacancy_publications` зберігає history publication days, а `notification_outbox` транзакційно зберігає `INSERTED` і `REPUBLISHED` delivery state.
+- `vacancy_versions` зберігає незмінний JSON snapshot кожного distinct meaningful canonical content state. Незмінні щогодинні observations і republish лише з новою датою не створюють version; incomplete first observation має marker `snapshot_complete`, а повне збагачення створює окремий complete state.
+
+Архітектурний контракт для майбутньої аналітики: `sources → canonical Vacancy → vacancies + vacancy_versions → source-neutral enrichment`. Кожен meaningful canonical content state можна відновити з history без повторного scraping; майбутні skill/technology taxonomy, mentions і trends будуватимуться над цими snapshots. Operational identity лишається source-qualified, тому Djinni, DOU та наступні sources не merge-яться. `vacancy_discoveries` лишається окремим provenance history, який можна join-ити з versions. Поточні дані є targeted sample за активними профілями, а не повним зрізом ринку.
 
 Політика Telegram:
 
@@ -82,7 +85,7 @@ Routes `main` і `alternate` отримують credentials лише з environm
 s3://$R2_BUCKET_NAME/production/vacancies.db
 ```
 
-Hourly workflow виконує `restore → crawl → validate → persist`. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 4 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state.
+Hourly workflow виконує `restore → crawl → validate → persist`. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 5 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state.
 
 Для workflow потрібні лише names secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT_URL`, `R2_BUCKET_NAME`. Значення не зберігаються в repository або документації.
 

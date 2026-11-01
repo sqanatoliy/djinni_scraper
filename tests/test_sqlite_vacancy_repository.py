@@ -17,6 +17,7 @@ from djinni_scraper.persistence.sqlite import (
     vacancy_content_hash,
     vacancy_identity_key,
     vacancy_to_record,
+    vacancy_version_snapshot,
 )
 
 
@@ -99,6 +100,14 @@ def _vacancy_count(repository) -> int:
     return repository.connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0]
 
 
+def _version_count(repository, vacancy_id: int | None = None) -> int:
+    if vacancy_id is None:
+        return repository.connection.execute("SELECT COUNT(*) FROM vacancy_versions").fetchone()[0]
+    return repository.connection.execute(
+        "SELECT COUNT(*) FROM vacancy_versions WHERE vacancy_id = ?", (vacancy_id,)
+    ).fetchone()[0]
+
+
 V1_SCHEMA = """
 CREATE TABLE vacancies (
     id INTEGER PRIMARY KEY,
@@ -178,25 +187,72 @@ def create_v1_database(path: Path, vacancy: Vacancy, profiles: tuple[str, ...]) 
         connection.close()
 
 
-def test_initialization_creates_schema_v4_with_publications_discoveries_outbox_and_foreign_keys(repository):
+def create_v4_database(path: Path) -> None:
+    repository = SQLiteVacancyRepository(path)
+    repository.open()
+    initial = full_vacancy(discovery_profiles=("python",))
+    first = persist(
+        repository,
+        initial,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    repository.mark_notification_failed(
+        first.notification_event_id,
+        attempted_at=LATER,
+        next_attempt_at=LATEST,
+        error="temporary failure",
+    )
+    persist(
+        repository,
+        replace(
+            initial,
+            description="Changed canonical description",
+            published_at=date(2026, 8, 15),
+            scraped_at=LATER,
+        ),
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    repository.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE vacancy_versions")
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_initialization_creates_schema_v5_with_version_history_and_foreign_keys(repository):
     connection = repository.connection
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     vacancy_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancies)")}
     discovery_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancy_discoveries)")}
     publication_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancy_publications)")}
     outbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(notification_outbox)")}
+    version_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancy_versions)")}
     vacancy_indexes = {row[1] for row in connection.execute("PRAGMA index_list(vacancies)")}
+    version_indexes = {row[1] for row in connection.execute("PRAGMA index_list(vacancy_versions)")}
     discovery_foreign_keys = list(connection.execute("PRAGMA foreign_key_list(vacancy_discoveries)"))
 
-    assert {"vacancies", "vacancy_publications", "vacancy_discoveries", "notification_outbox"}.issubset(tables)
+    assert {
+        "vacancies",
+        "vacancy_publications",
+        "vacancy_discoveries",
+        "notification_outbox",
+        "vacancy_versions",
+    }.issubset(tables)
     assert {"content_hash", "first_seen_at", "last_seen_at"}.issubset(vacancy_columns)
     assert "discovery_profiles_json" not in vacancy_columns
     assert _source_transport_only_columns().isdisjoint(vacancy_columns)
     assert {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"} == discovery_columns
     assert {"id", "vacancy_id", "published_at", "first_observed_at", "last_observed_at"} == publication_columns
     assert {"vacancy_id", "publication_id", "event_type", "event_key", "route", "attempt_count", "next_attempt_at", "delivered_at"}.issubset(outbox_columns)
+    assert {"id", "vacancy_id", "content_hash", "observed_at", "snapshot_complete", "snapshot_json"} == version_columns
     assert {"idx_vacancies_source", "idx_vacancies_source_vacancy_id", "idx_vacancies_published_at", "idx_vacancies_last_seen_at"}.issubset(vacancy_indexes)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert "idx_vacancy_versions_vacancy_observed" in version_indexes
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert discovery_foreign_keys[0][2:] == ("vacancies", "vacancy_id", "id", "NO ACTION", "CASCADE", "NONE")
 
@@ -211,7 +267,7 @@ def test_v1_database_migrates_preserving_rows_backfills_discovery_hash_and_times
     row = _vacancy_row(repository, 1)
     restored = repository.get_vacancy_by_identity_key(vacancy_identity_key(legacy))
 
-    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _vacancy_count(repository) == 1
     assert restored == replace(legacy, discovery_profiles=("data_engineer", "python"))
     assert row["content_hash"] == vacancy_content_hash(legacy)
@@ -220,11 +276,16 @@ def test_v1_database_migrates_preserving_rows_backfills_discovery_hash_and_times
     assert repository.get_discovery_profiles(1) == ("data_engineer", "python")
     assert [publication.published_at for publication in repository.list_publications(1)] == ["2026-08-12"]
     assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
+    versions = repository.list_vacancy_versions(1)
+    assert len(versions) == 1
+    assert versions[0].content_hash == vacancy_content_hash(legacy)
+    assert versions[0].observed_at == OBSERVED_AT
+    assert versions[0].snapshot_complete is True
     assert "discovery_profiles_json" not in {entry[1] for entry in repository.connection.execute("PRAGMA table_info(vacancies)")}
 
     repository.close()
     repository.open()
-    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _vacancy_count(repository) == 1
     repository.close()
 
@@ -250,14 +311,73 @@ def test_failed_v1_migration_rolls_back_table_and_user_version(tmp_path, monkeyp
         connection.close()
 
 
+def test_v4_database_migrates_to_v5_with_baseline_version_without_new_notifications(tmp_path):
+    db_path = tmp_path / "v4.db"
+    create_v4_database(db_path)
+
+    repository = SQLiteVacancyRepository(db_path)
+    repository.open()
+    connection = repository.connection
+    version = repository.list_vacancy_versions(1)[0]
+    outbox_rows = list(
+        connection.execute(
+            "SELECT id, event_type, attempt_count, last_error FROM notification_outbox ORDER BY id"
+        )
+    )
+
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert _vacancy_count(repository) == 1
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 2
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 1
+    assert [tuple(row) for row in outbox_rows] == [
+        (1, "VACANCY_INSERTED", 1, "temporary failure"),
+        (2, "VACANCY_REPUBLISHED", 0, None),
+    ]
+    assert version.snapshot_complete is True
+    assert version.observed_at == LATER
+    assert version.content_hash == _vacancy_row(repository, 1)["content_hash"]
+    assert version.snapshot["description"] == "Changed canonical description"
+    assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert list(connection.execute("PRAGMA foreign_key_check")) == []
+
+    repository.close()
+    repository.open()
+    assert _version_count(repository, 1) == 1
+    assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 2
+
+
+def test_failed_v4_to_v5_migration_rolls_back_versions_and_schema_version(tmp_path, monkeypatch):
+    db_path = tmp_path / "v4-failure.db"
+    create_v4_database(db_path)
+    monkeypatch.setattr(
+        sqlite_module,
+        "_create_vacancy_version_indexes",
+        lambda _connection: (_ for _ in ()).throw(sqlite3.OperationalError("forced migration failure")),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="forced migration failure"):
+        SQLiteVacancyRepository(db_path).open()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'vacancy_versions'"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
 def test_unsupported_future_schema_is_rejected(tmp_path):
     db_path = tmp_path / "future.db"
     connection = sqlite3.connect(db_path)
-    connection.execute("PRAGMA user_version = 5")
+    connection.execute("PRAGMA user_version = 6")
     connection.commit()
     connection.close()
 
-    with pytest.raises(RuntimeError, match="Unsupported SQLite schema version 5"):
+    with pytest.raises(RuntimeError, match="Unsupported SQLite schema version 6"):
         SQLiteVacancyRepository(db_path).open()
 
 
@@ -272,6 +392,49 @@ def test_new_stable_identity_inserts_once_and_duplicate_is_unchanged(repository)
     assert second.status is PersistenceStatus.UNCHANGED
     assert second.discovery_added is False
     assert _vacancy_count(repository) == 1
+    assert _version_count(repository, first.vacancy_id) == 1
+    version = repository.list_vacancy_versions(first.vacancy_id)[0]
+    assert version.snapshot_complete is True
+    assert version.snapshot["description"] == vacancy.description
+    assert version.snapshot["raw_source_metadata"] == vacancy.raw_source_metadata
+
+
+def test_updated_content_creates_immutable_history_with_old_and_new_snapshots(repository):
+    original = full_vacancy(description="Python and Django")
+    first = persist(repository, original)
+    updated = replace(original, description="Python, FastAPI, and AWS", scraped_at=LATER)
+
+    result = persist(repository, updated, observed_at=LATER)
+    versions = repository.list_vacancy_versions(first.vacancy_id)
+
+    assert result.status is PersistenceStatus.UPDATED
+    assert [version.observed_at for version in versions] == [OBSERVED_AT, LATER]
+    assert [version.snapshot["description"] for version in versions] == [
+        "Python and Django",
+        "Python, FastAPI, and AWS",
+    ]
+    assert [version.content_hash for version in versions] == [
+        vacancy_content_hash(original),
+        vacancy_content_hash(updated),
+    ]
+
+
+def test_returning_to_a_previously_seen_content_state_updates_current_without_duplicate_version(repository):
+    original = full_vacancy(description="State A")
+    first = persist(repository, original)
+    changed = replace(original, description="State B", scraped_at=LATER)
+    persist(repository, changed, observed_at=LATER)
+
+    restored = persist(
+        repository,
+        replace(original, scraped_at=LATEST),
+        observed_at=LATEST,
+    )
+    versions = repository.list_vacancy_versions(first.vacancy_id)
+
+    assert restored.status is PersistenceStatus.UPDATED
+    assert repository.get_vacancy(original).description == "State A"
+    assert [version.snapshot["description"] for version in versions] == ["State A", "State B"]
 
 
 def test_different_profile_merges_discovery_without_duplicate_or_content_update(repository):
@@ -339,6 +502,20 @@ def test_same_url_from_different_sources_remains_distinct(repository):
     persist(repository, other_source)
 
     assert _vacancy_count(repository) == 2
+
+
+def test_same_source_vacancy_id_from_different_sources_has_independent_history(repository):
+    djinni = full_vacancy(source="djinni", source_vacancy_id="123")
+    dou = replace(djinni, source="dou", source_vacancy_id="123")
+
+    djinni_result = persist(repository, djinni)
+    dou_result = persist(repository, dou, observed_at=LATER)
+
+    assert djinni_result.vacancy_id != dou_result.vacancy_id
+    assert _vacancy_count(repository) == 2
+    assert len(repository.list_vacancy_versions(djinni_result.vacancy_id)) == 1
+    assert len(repository.list_vacancy_versions(dou_result.vacancy_id)) == 1
+    assert repository.list_vacancy_versions(dou_result.vacancy_id)[0].snapshot["source"] == "dou"
 
 
 def test_conflicting_stable_id_and_fallback_rows_fail_without_merging(repository):
@@ -414,6 +591,7 @@ def test_newer_publication_returns_republished_keeps_identity_and_refreshes_comp
         "2026-08-12",
         "2026-08-15",
     ]
+    assert _version_count(repository, first.vacancy_id) == 2
 
 
 def test_publication_date_alone_does_not_create_content_update_but_is_republished(repository):
@@ -426,6 +604,8 @@ def test_publication_date_alone_does_not_create_content_update_but_is_republishe
     assert vacancy_content_hash(original) == vacancy_content_hash(repost)
     assert result.status is PersistenceStatus.REPUBLISHED
     assert result.vacancy_id == first.vacancy_id
+    assert len(repository.list_publications(first.vacancy_id)) == 2
+    assert _version_count(repository, first.vacancy_id) == 1
 
 
 @pytest.mark.parametrize(
@@ -652,6 +832,10 @@ def test_scraped_at_and_raw_metadata_alone_do_not_create_content_update(reposito
     assert row["raw_source_metadata_json"] == vacancy_to_record(original)["raw_source_metadata_json"]
     assert row["last_seen_at"] == LATER.isoformat()
     assert vacancy_content_hash(original) == vacancy_content_hash(noisy)
+    assert _version_count(repository, first.vacancy_id) == 1
+    assert repository.list_vacancy_versions(first.vacancy_id)[0].snapshot["raw_source_metadata"] == (
+        original.raw_source_metadata
+    )
 
 
 def test_complete_snapshot_can_clear_an_optional_field_when_source_reports_it_missing(repository):
@@ -679,6 +863,21 @@ def test_content_hash_is_deterministic_and_excludes_identity_and_discovery(repos
     assert vacancy_content_hash(original) == vacancy_content_hash(original)
     assert vacancy_content_hash(original) == vacancy_content_hash(equivalent)
     assert vacancy_to_record(original)["content_hash"] == vacancy_content_hash(original)
+
+
+def test_version_snapshot_serialization_is_deterministic_and_retains_raw_metadata(repository):
+    original = full_vacancy()
+    reordered_raw_metadata = {
+        "site": {"publication_info": "196 views"},
+        "jsonld": {"identifier": 842583},
+    }
+    equivalent = replace(original, raw_source_metadata=reordered_raw_metadata)
+
+    assert vacancy_version_snapshot(original) == vacancy_version_snapshot(equivalent)
+
+    result = persist(repository, original)
+    version = repository.list_vacancy_versions(result.vacancy_id)[0]
+    assert version.snapshot["raw_source_metadata"] == original.raw_source_metadata
 
 
 def test_repeat_profile_preserves_first_discovered_and_updates_last_discovered(repository):
@@ -731,6 +930,7 @@ def test_incomplete_observation_does_not_erase_full_canonical_snapshot(repositor
     assert restored.company == full.company
     assert restored.locations == full.locations
     assert repository.get_discovery_profiles(first.vacancy_id) == ("other", "python")
+    assert _version_count(repository, first.vacancy_id) == 1
 
 
 def test_incomplete_new_observation_inserts_and_later_complete_snapshot_enriches(repository):
@@ -749,6 +949,35 @@ def test_incomplete_new_observation_inserts_and_later_complete_snapshot_enriches
     assert first.status is PersistenceStatus.INSERTED
     assert enriched.status is PersistenceStatus.UPDATED
     assert repository.get_vacancy(complete) == complete
+    versions = repository.list_vacancy_versions(first.vacancy_id)
+    assert [version.snapshot_complete for version in versions] == [False, True]
+    assert [version.snapshot["title"] for version in versions] == ["Listing title", "Detail title"]
+
+
+def test_incomplete_observation_can_be_followed_by_complete_same_hash_once(repository):
+    listing = minimal_vacancy(source_vacancy_id="incomplete", raw_source_metadata={"site": {"v": 1}})
+    first = persist(repository, listing, complete=False)
+    repeated = persist(repository, replace(listing, scraped_at=LATER), observed_at=LATER, complete=False)
+    enriched = persist(
+        repository,
+        replace(listing, scraped_at=LATEST, raw_source_metadata={"site": {"v": 2}}),
+        observed_at=LATEST,
+        complete=True,
+    )
+    later_incomplete = persist(
+        repository,
+        replace(listing, title="Listing regression", scraped_at=LATEST + timedelta(hours=1)),
+        observed_at=LATEST + timedelta(hours=1),
+        complete=False,
+    )
+
+    versions = repository.list_vacancy_versions(first.vacancy_id)
+    assert repeated.status is PersistenceStatus.UNCHANGED
+    assert enriched.status is PersistenceStatus.UNCHANGED
+    assert later_incomplete.status is PersistenceStatus.UNCHANGED
+    assert [version.snapshot_complete for version in versions] == [False, True]
+    assert [version.content_hash for version in versions] == [vacancy_content_hash(listing)] * 2
+    assert repository.get_vacancy(listing).title == listing.title
 
 
 def test_discovery_failure_rolls_back_vacancy_insert(repository, monkeypatch):
@@ -763,6 +992,7 @@ def test_discovery_failure_rolls_back_vacancy_insert(repository, monkeypatch):
 
     assert _vacancy_count(repository) == 0
     assert repository.connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 0
+    assert _version_count(repository) == 0
 
 
 def test_vacancy_update_failure_does_not_modify_discovery(repository, monkeypatch):
@@ -803,6 +1033,7 @@ def test_foreign_key_integrity_and_cascade_are_active(repository):
     connection.commit()
 
     assert connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_versions").fetchone()[0] == 0
 
 
 def test_repository_creates_missing_parent_directories_and_round_trips_full_values(tmp_path):

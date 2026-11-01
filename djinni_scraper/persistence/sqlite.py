@@ -16,14 +16,16 @@ from urllib.parse import urlsplit, urlunsplit
 from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequirement, Location, Vacancy
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _V1_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
 _V3_SCHEMA_VERSION = 3
+_V4_SCHEMA_VERSION = 4
 VACANCIES_TABLE = "vacancies"
 DISCOVERIES_TABLE = "vacancy_discoveries"
 PUBLICATIONS_TABLE = "vacancy_publications"
 OUTBOX_TABLE = "notification_outbox"
+VERSIONS_TABLE = "vacancy_versions"
 VACANCY_INSERTED_EVENT = "VACANCY_INSERTED"
 VACANCY_REPUBLISHED_EVENT = "VACANCY_REPUBLISHED"
 
@@ -82,6 +84,9 @@ _V3_OUTBOX_COLUMNS = frozenset(
     }
 )
 _OUTBOX_COLUMNS = _V3_OUTBOX_COLUMNS | {"publication_id", "event_key"}
+_VERSION_COLUMNS = frozenset(
+    {"id", "vacancy_id", "content_hash", "observed_at", "snapshot_complete", "snapshot_json"}
+)
 _CONTENT_FIELDS = (
     "url",
     "title",
@@ -145,6 +150,18 @@ class VacancyPublication:
     published_at: str
     first_observed_at: datetime
     last_observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class VacancyVersion:
+    """One immutable canonical content state retained for future analytics."""
+
+    id: int
+    vacancy_id: int
+    content_hash: str
+    observed_at: datetime
+    snapshot_complete: bool
+    snapshot: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,9 +261,11 @@ class SQLiteVacancyRepository:
             publication_id = None
             publication_added = False
             republished = False
+            create_version = False
             if existing_row is None:
                 vacancy_id = self._insert_vacancy_row(connection, record, observed_at_text)
                 status = PersistenceStatus.INSERTED
+                create_version = True
                 if publication_day is not None:
                     publication_id = self._insert_publication(
                         connection,
@@ -279,14 +298,36 @@ class SQLiteVacancyRepository:
                 )
                 if republished:
                     status = PersistenceStatus.REPUBLISHED
-                if observation_complete and not historical_publication and (
+                update_current_snapshot = observation_complete and not historical_publication and (
                     content_changed or republished or baseline_date_became_known
-                ):
+                )
+                if update_current_snapshot:
                     self._update_vacancy_row(connection, vacancy_id, record, observed_at_text)
                     if not republished:
                         status = PersistenceStatus.UPDATED
                 else:
                     self._touch_last_seen(connection, vacancy_id, observed_at_text)
+
+                create_version = (
+                    observation_complete
+                    and not historical_publication
+                    and not self._has_vacancy_version(
+                        connection,
+                        vacancy_id=vacancy_id,
+                        content_hash=record["content_hash"],
+                        snapshot_complete=True,
+                    )
+                )
+
+            if create_version:
+                self._record_vacancy_version(
+                    connection,
+                    vacancy_id=vacancy_id,
+                    vacancy=vacancy,
+                    content_hash=record["content_hash"],
+                    observed_at=observed_at_text,
+                    snapshot_complete=observation_complete,
+                )
 
             discovery_added = self._merge_discoveries(
                 connection,
@@ -393,6 +434,19 @@ class SQLiteVacancyRepository:
         )
         return tuple(_row_to_publication(row) for row in rows)
 
+    def list_vacancy_versions(self, vacancy_id: int) -> tuple[VacancyVersion, ...]:
+        """Returns immutable canonical states in deterministic observation order."""
+        rows = self._require_connection().execute(
+            """
+            SELECT id, vacancy_id, content_hash, observed_at, snapshot_complete, snapshot_json
+            FROM vacancy_versions
+            WHERE vacancy_id = ?
+            ORDER BY observed_at, id
+            """,
+            (vacancy_id,),
+        )
+        return tuple(_row_to_vacancy_version(row) for row in rows)
+
     def get_latest_publication(self, vacancy_id: int) -> VacancyPublication | None:
         """Returns the latest known normalized publication day, if one exists."""
         publications = self.list_publications(vacancy_id)
@@ -474,6 +528,49 @@ class SQLiteVacancyRepository:
         return connection.execute(
             "SELECT 1 FROM vacancy_publications WHERE vacancy_id = ? LIMIT 1", (vacancy_id,)
         ).fetchone() is not None
+
+    @staticmethod
+    def _has_vacancy_version(
+        connection: sqlite3.Connection,
+        *,
+        vacancy_id: int,
+        content_hash: str,
+        snapshot_complete: bool,
+    ) -> bool:
+        return connection.execute(
+            """
+            SELECT 1 FROM vacancy_versions
+            WHERE vacancy_id = ? AND content_hash = ? AND snapshot_complete = ?
+            LIMIT 1
+            """,
+            (vacancy_id, content_hash, int(snapshot_complete)),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _record_vacancy_version(
+        connection: sqlite3.Connection,
+        *,
+        vacancy_id: int,
+        vacancy: Vacancy,
+        content_hash: str,
+        observed_at: str,
+        snapshot_complete: bool,
+    ) -> None:
+        """Records one distinct content/completeness state in the caller's transaction."""
+        connection.execute(
+            """
+            INSERT INTO vacancy_versions (
+                vacancy_id, content_hash, observed_at, snapshot_complete, snapshot_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                vacancy_id,
+                content_hash,
+                observed_at,
+                int(snapshot_complete),
+                vacancy_version_snapshot(vacancy),
+            ),
+        )
 
     def _observe_publication(
         self,
@@ -774,13 +871,13 @@ class SQLiteVacancyRepository:
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Creates schema v4 or migrates canonical v1/v2/v3 databases in place."""
+    """Creates schema v5 or migrates canonical v1 through v4 databases in place."""
     connection.execute("PRAGMA foreign_keys = ON")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
 
     if current_version == 0 and not vacancy_columns:
-        _create_new_v4_schema(connection)
+        _create_new_v5_schema(connection)
         return
     if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(
         vacancy_columns
@@ -794,15 +891,19 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     if current_version == _V3_SCHEMA_VERSION:
         _validate_v3_schema(connection)
         _migrate_v3_to_v4(connection)
-        return
-    if current_version == SCHEMA_VERSION:
+        current_version = _V4_SCHEMA_VERSION
+    if current_version == _V4_SCHEMA_VERSION:
         _validate_v4_schema(connection)
+        _migrate_v4_to_v5(connection)
+        current_version = SCHEMA_VERSION
+    if current_version == SCHEMA_VERSION:
+        _validate_v5_schema(connection)
         return
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"
         )
-    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, v3, or v4")
+    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, v3, v4, or v5")
 
 
 def validate_supported_schema(connection: sqlite3.Connection) -> int:
@@ -823,25 +924,30 @@ def validate_supported_schema(connection: sqlite3.Connection) -> int:
     if current_version == _V3_SCHEMA_VERSION:
         _validate_v3_schema(connection)
         return current_version
-    if current_version == SCHEMA_VERSION:
+    if current_version == _V4_SCHEMA_VERSION:
         _validate_v4_schema(connection)
+        return current_version
+    if current_version == SCHEMA_VERSION:
+        _validate_v5_schema(connection)
         return current_version
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"
         )
-    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, v3, or v4")
+    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, v3, v4, or v5")
 
 
-def _create_new_v4_schema(connection: sqlite3.Connection) -> None:
+def _create_new_v5_schema(connection: sqlite3.Connection) -> None:
     try:
         connection.execute("BEGIN")
         _create_vacancies_table(connection)
         _create_discoveries_table(connection)
         _create_publications_table(connection)
         _create_outbox_table(connection)
+        _create_vacancy_versions_table(connection)
         _create_v2_indexes(connection)
         _create_outbox_indexes(connection)
+        _create_vacancy_version_indexes(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -1007,6 +1113,23 @@ def _create_outbox_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_vacancy_versions_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE vacancy_versions (
+            id INTEGER PRIMARY KEY,
+            vacancy_id INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            snapshot_complete INTEGER NOT NULL CHECK (snapshot_complete IN (0, 1)),
+            snapshot_json TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            UNIQUE (vacancy_id, content_hash, snapshot_complete)
+        )
+        """
+    )
+
+
 def _create_v3_outbox_table(connection: sqlite3.Connection) -> None:
     """Creates the legacy v3 outbox only while migrating an older database."""
     connection.execute(
@@ -1051,6 +1174,13 @@ def _create_outbox_indexes(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX idx_notification_outbox_vacancy_id ON notification_outbox (vacancy_id)"
+    )
+
+
+def _create_vacancy_version_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE INDEX idx_vacancy_versions_vacancy_observed "
+        "ON vacancy_versions (vacancy_id, observed_at, id)"
     )
 
 
@@ -1141,7 +1271,7 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             )
         connection.execute(f"DROP TABLE {legacy_outbox_table}")
         _create_outbox_indexes(connection)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute(f"PRAGMA user_version = {_V4_SCHEMA_VERSION}")
         connection.commit()
     except Exception:
         connection.rollback()
@@ -1156,6 +1286,57 @@ def _validate_v4_schema(connection: sqlite3.Connection) -> None:
         outbox_columns
     ):
         raise RuntimeError("Existing database is marked schema v4 but does not match publication/outbox schema")
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """Backfills one baseline content state per v4 vacancy without emitting events."""
+    try:
+        connection.execute("BEGIN")
+        _create_vacancy_versions_table(connection)
+        profile_rows = connection.execute(
+            """
+            SELECT vacancy_id, profile_slug
+            FROM vacancy_discoveries
+            ORDER BY vacancy_id, profile_slug
+            """
+        )
+        profiles_by_vacancy: dict[int, list[str]] = {}
+        for profile_row in profile_rows:
+            profiles_by_vacancy.setdefault(profile_row["vacancy_id"], []).append(
+                profile_row["profile_slug"]
+            )
+
+        for row in connection.execute("SELECT * FROM vacancies ORDER BY id"):
+            vacancy = row_to_vacancy(
+                row,
+                discovery_profiles=tuple(profiles_by_vacancy.get(row["id"], ())),
+            )
+            connection.execute(
+                """
+                INSERT INTO vacancy_versions (
+                    vacancy_id, content_hash, observed_at, snapshot_complete, snapshot_json
+                ) VALUES (?, ?, ?, 1, ?)
+                """,
+                (
+                    row["id"],
+                    row["content_hash"],
+                    row["scraped_at"],
+                    vacancy_version_snapshot(vacancy),
+                ),
+            )
+        _create_vacancy_version_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _validate_v5_schema(connection: sqlite3.Connection) -> None:
+    _validate_v4_schema(connection)
+    version_columns = _table_columns(connection, VERSIONS_TABLE)
+    if not _VERSION_COLUMNS.issubset(version_columns):
+        raise RuntimeError("Existing database is marked schema v5 but does not match vacancy version schema")
 
 
 def vacancy_identity_key(vacancy: Vacancy) -> str:
@@ -1180,6 +1361,13 @@ def vacancy_content_hash(vacancy: Vacancy) -> str:
     """Hashes the deterministic canonical content projection with SHA-256."""
     serialized = _json_dump(canonical_content_projection(vacancy)).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
+
+
+def vacancy_version_snapshot(vacancy: Vacancy) -> str:
+    """Serializes a source-neutral canonical snapshot for immutable history."""
+    snapshot = vacancy.to_dict()
+    snapshot["url"] = _normalized_identity_url(snapshot["url"])
+    return _json_dump(snapshot)
 
 
 def vacancy_to_record(vacancy: Vacancy) -> dict[str, Any]:
@@ -1273,6 +1461,17 @@ def _row_to_publication(row: Mapping[str, Any]) -> VacancyPublication:
         published_at=row["published_at"],
         first_observed_at=_parse_datetime(row["first_observed_at"]),
         last_observed_at=_parse_datetime(row["last_observed_at"]),
+    )
+
+
+def _row_to_vacancy_version(row: Mapping[str, Any]) -> VacancyVersion:
+    return VacancyVersion(
+        id=row["id"],
+        vacancy_id=row["vacancy_id"],
+        content_hash=row["content_hash"],
+        observed_at=_parse_datetime(row["observed_at"]),
+        snapshot_complete=bool(row["snapshot_complete"]),
+        snapshot=_json_load(row["snapshot_json"]),
     )
 
 
