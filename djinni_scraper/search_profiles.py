@@ -29,6 +29,7 @@ class DjinniSearchQuery:
     def to_params(self) -> Mapping[str, tuple[str, ...]]:
         """Returns immutable URL-builder input without performing URL encoding."""
         params = {
+            "search_type": ("basic-search",),
             "primary_keyword": (self.primary_keyword,),
             "exp_level": self.exp_level,
             "english_level": self.english_level,

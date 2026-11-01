@@ -64,6 +64,7 @@ def test_formal_profile_query_preserves_current_filters_and_english_levels(slug)
 
     assert _query(get_start_url(profile.query_params)) == {
         **EXPECTED_PROFILES[slug],
+        "search_type": ["basic-search"],
         "english_level": list(COMMON_ENGLISH_LEVELS),
     }
     assert profile.query.employment == ()
@@ -84,6 +85,7 @@ def test_data_engineer_url_encodes_once_and_keeps_the_current_jobs_base_url():
     assert urlsplit(url).netloc == "djinni.co"
     assert urlsplit(url).path == "/jobs/"
     assert _query(url)["primary_keyword"] == ["Data Engineer"]
+    assert _query(url)["search_type"] == ["basic-search"]
     assert "%2520" not in url
 
 
@@ -278,7 +280,8 @@ def test_workflow_schedules_the_four_profiles_without_repeating_formal_query_val
         return workflow[start:] if end == -1 else workflow[start:end]
 
     for slug in ("python", "data_engineer", "other", "support"):
-        assert f"scrapy crawl djinni -a profile={slug}" in workflow
+        assert f"python scripts/run_djinni_profile.py --profile {slug}" in workflow
+    assert "scrapy crawl djinni" not in workflow
     assert "-a primary_keyword=" not in workflow
     assert "-a exp_level=" not in workflow
     assert "-a english_level=" not in workflow

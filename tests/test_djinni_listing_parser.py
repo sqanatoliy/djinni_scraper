@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 
@@ -72,5 +73,39 @@ def test_pagination_returns_absolute_next_page_url(spider, listing_response):
     )
 
 
+def test_pagination_keeps_all_active_profile_filters_when_the_link_is_partial(spider):
+    response = HtmlResponse(
+        url=(
+            "https://djinni.co/jobs/?search_type=basic-search&primary_keyword=Python"
+            "&exp_level=no_exp&exp_level=1y&exp_level=2y"
+            "&english_level=no_english&english_level=basic"
+        ),
+        body=(FIXTURES_DIR / "jobs_listing.html").read_bytes(),
+        encoding="utf-8",
+    )
+
+    assert spider._get_next_page_url(response) == (
+        "https://djinni.co/jobs/?search_type=basic-search&primary_keyword=Python"
+        "&exp_level=no_exp&exp_level=1y&exp_level=2y"
+        "&english_level=no_english&english_level=basic&page=2"
+    )
+
+
 def test_pagination_returns_none_on_last_page(spider):
     assert spider._get_next_page_url(load_response("jobs_listing_last_page.html")) is None
+
+
+def test_listing_completion_marker_is_emitted_only_after_the_last_page(spider, listing_response):
+    completed = []
+    spider._record_listing_completed = lambda: completed.append(True)
+
+    async def collect(response):
+        return [request async for request in spider.parse_pagination(response)]
+
+    next_page_requests = asyncio.run(collect(listing_response))
+    assert len(next_page_requests) == 1
+    assert completed == []
+
+    last_page_requests = asyncio.run(collect(load_response("jobs_listing_last_page.html")))
+    assert last_page_requests == []
+    assert completed == [True]

@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from urllib.parse import urljoin as urllib_urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin as urllib_urljoin, urlsplit, urlunsplit
 
 import scrapy
 from decouple import config
@@ -24,7 +24,7 @@ LOGIN_TIMEOUT_MS = 10_000
 # browser actions; keep this sequence regression-tested.
 DJINNI_AUTH_STEP_DELAY_MS = 2_000
 AD_HOC_DISCOVERY_ARGUMENT = "category"
-LOGIN_ACTION_NAME = re.compile(r"^(?:Увійти|Log In|Login)$", re.IGNORECASE)
+LOGIN_ACTION_NAME = re.compile(r"^(?:Увійти|Вхід|Log In|Login|Sign In)$", re.IGNORECASE)
 
 
 class LoginUIError(RuntimeError):
@@ -32,6 +32,16 @@ class LoginUIError(RuntimeError):
 
 
 class DjinniSelectors:
+    # The public landing page may be Ukrainian (/) or the international /hire
+    # landing page.  Both expose a visible UI link to the login form, but the
+    # accessible name differs (for example, /hire currently says "Sign In").
+    LOGIN_ACTION_HREF_SELECTOR = 'a[href*="/login"]:visible'
+    LOGIN_ACTION_NAV_SELECTOR = 'nav a[href*="/login"]:visible, header a[href*="/login"]:visible'
+    LOGIN_ACTION_FALLBACK_SELECTOR = (
+        'a.btn[href*="/login"]:visible, [role="navigation"] a[href*="/login"]:visible, '
+        'button[data-bs-target*="login" i]:visible, button[data-target*="login" i]:visible'
+    )
+    LOGIN_ACTION_DIAGNOSTIC_SELECTOR = 'a[href*="/login"]:visible'
     LOGIN_FORM_SELECTOR = 'form:has(input[name="email"]), form:has(input[type="email"])'
     EMAIL_SELECTOR = 'input[name="email"], input[type="email"]'
     PASSWORD_SELECTOR = 'input[name="password"], input[type="password"]'
@@ -102,6 +112,8 @@ class DjinniSpider(scrapy.Spider):
             yield self._jobs_request(self.start_urls[0])
         else:
             self.logger.info("🔄 Виконуємо авторизацію...")
+            # Never visit a profile search URL until the browser has confirmed
+            # authentication through the visible homepage UI.
             yield self._login_request(self.start_urls[0], auth_recovery_attempted=False)
 
     async def login(self, response):
@@ -175,8 +187,15 @@ class DjinniSpider(scrapy.Spider):
                     await self._login_diagnostic(auth_page, email, password),
                 )
                 self._discard_storage_state()
+                failure_reason = (
+                    "auth_challenge"
+                    if await self._is_visible(auth_page.locator(DjinniSelectors.LOGIN_CHALLENGE_SELECTOR))
+                    else "auth_rejected"
+                )
+                self._record_application_failure(failure_reason)
                 raise CloseSpider("Djinni login was rejected or remained anonymous")
 
+            self._record_authenticated()
             try:
                 step = "storage state write"
                 await auth_page.context.storage_state(path=STATE_FILE)
@@ -193,6 +212,7 @@ class DjinniSpider(scrapy.Spider):
             )
         except LoginUIError as error:
             self._discard_storage_state()
+            self._record_application_failure("login_ui_unavailable")
             self.logger.error(
                 "Djinni login UI failed: %s; %s",
                 error,
@@ -201,6 +221,7 @@ class DjinniSpider(scrapy.Spider):
             raise CloseSpider("Djinni login UI was unavailable") from error
         except PlaywrightTimeoutError as error:
             self._discard_storage_state()
+            self._record_application_failure("login_timeout")
             self.logger.error(
                 "Djinni login timed out: %s",
                 await self._login_diagnostic(auth_page or initial_page, email, password),
@@ -208,6 +229,7 @@ class DjinniSpider(scrapy.Spider):
             raise CloseSpider("Djinni login timed out or remained anonymous") from error
         except PlaywrightError as error:
             self._discard_storage_state()
+            self._record_infrastructure_failure("playwright_error")
             self.logger.error(
                 "Djinni Playwright error during %s (%s): error=%s %s",
                 step,
@@ -224,12 +246,14 @@ class DjinniSpider(scrapy.Spider):
         """Парсимо вакансії після авторизації."""
         page = response.meta.get("playwright_page")
         if not page:
+            self._record_infrastructure_failure("jobs_page_missing")
             raise CloseSpider("Djinni jobs request did not receive a Playwright page")
 
         try:
             if not await self._is_authenticated(page):
                 self._discard_storage_state()
                 if response.meta.get("auth_recovery_attempted", False):
+                    self._record_application_failure("auth_recovery_failed")
                     raise CloseSpider("Djinni authentication recovery failed; anonymous jobs page was not parsed")
 
                 target_url = response.meta.get("auth_target_url", response.url)
@@ -238,7 +262,11 @@ class DjinniSpider(scrapy.Spider):
                 return
 
             self.logger.info("✅ Авторизація активна.")
-            for job in response.css(DjinniSelectors.JOBS_LIST_SELECTOR):
+            self._record_authenticated()
+            self._record_search_requested(response.url)
+            jobs = response.css(DjinniSelectors.JOBS_LIST_SELECTOR)
+            self._record_listing_page(len(jobs))
+            for job in jobs:
                 yield self._detail_request(self._parse_job_card(job, response))
             async for next_page_request in self.parse_pagination(response):
                 yield next_page_request
@@ -263,7 +291,7 @@ class DjinniSpider(scrapy.Spider):
         """Obtains an initial managed page; login itself happens only in a fresh tab."""
         self._get_credentials()
         return scrapy.Request(
-            url=target_url,
+            url=DJINNI_HOME_URL,
             callback=self.login,
             meta={
                 "playwright": True,
@@ -285,14 +313,14 @@ class DjinniSpider(scrapy.Spider):
             os.remove(STATE_FILE)
             self.logger.info("Removed stale local Djinni Playwright storage state.")
 
-    @staticmethod
-    def _get_credentials():
+    def _get_credentials(self):
         credentials = {
             "DJINNI_EMAIL": config("DJINNI_EMAIL", default="").strip(),
             "DJINNI_PASSWORD": config("DJINNI_PASSWORD", default="").strip(),
         }
         missing = [name for name, value in credentials.items() if not value]
         if missing:
+            self._record_application_failure("missing_credentials")
             raise CloseSpider(f"Missing required Djinni configuration: {', '.join(missing)}")
         return credentials["DJINNI_EMAIL"], credentials["DJINNI_PASSWORD"]
 
@@ -329,21 +357,52 @@ class DjinniSpider(scrapy.Spider):
             self.notification_route,
         )
 
+    def _record_authenticated(self):
+        self._set_run_stat("djinni/authenticated", True)
+
+    def _record_search_requested(self, url):
+        self._set_run_stat("djinni/search_requested", True)
+        self._set_run_stat("djinni/search_url", self._safe_url(url))
+
+    def _record_listing_page(self, job_cards):
+        self._set_run_stat("djinni/listing_pages", self._run_stat_value("djinni/listing_pages") + 1)
+        self._set_run_stat("djinni/listing_job_cards", self._run_stat_value("djinni/listing_job_cards") + job_cards)
+
+    def _record_listing_completed(self):
+        self._set_run_stat("djinni/listing_completed", True)
+
+    def _record_application_failure(self, reason):
+        self._set_run_stat("djinni/application_failure", reason)
+
+    def _record_infrastructure_failure(self, reason):
+        self._set_run_stat("djinni/infrastructure_failure", reason)
+
+    def _set_run_stat(self, key, value):
+        crawler = getattr(self, "crawler", None)
+        if crawler is not None:
+            crawler.stats.set_value(key, value)
+
+    def _run_stat_value(self, key):
+        crawler = getattr(self, "crawler", None)
+        return crawler.stats.get_value(key, 0) if crawler is not None else 0
+
     async def _wait_for_authenticated(self, page):
         """Waits for a positive logged-in-only marker or a visible login error, bounded in time."""
         authenticated_marker = page.locator(DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR).first
         login_error = page.locator(DjinniSelectors.LOGIN_ERROR_SELECTOR).first
+        login_challenge = page.locator(DjinniSelectors.LOGIN_CHALLENGE_SELECTOR).first
         marker_wait = asyncio.create_task(
             authenticated_marker.wait_for(state="visible", timeout=LOGIN_TIMEOUT_MS)
         )
         error_wait = asyncio.create_task(login_error.wait_for(state="visible", timeout=LOGIN_TIMEOUT_MS))
+        challenge_wait = asyncio.create_task(login_challenge.wait_for(state="visible", timeout=LOGIN_TIMEOUT_MS))
         done, pending = await asyncio.wait(
-            {marker_wait, error_wait}, return_when=asyncio.FIRST_COMPLETED
+            {marker_wait, error_wait, challenge_wait}, return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
-        marker_result, _error_result = await asyncio.gather(
-            marker_wait, error_wait, return_exceptions=True
+        marker_result, _error_result, _challenge_result = await asyncio.gather(
+            marker_wait, error_wait, challenge_wait, return_exceptions=True
         )
 
         if marker_wait in done and not isinstance(marker_result, BaseException):
@@ -362,6 +421,18 @@ class DjinniSpider(scrapy.Spider):
             count = await action.count()
             if count > 1:
                 raise LoginUIError(f"Djinni homepage {role} login action is ambiguous ({count} matches)")
+            if count == 1 and await action.is_visible():
+                return action
+
+        for label, selector in (
+            ("known login href", DjinniSelectors.LOGIN_ACTION_HREF_SELECTOR),
+            ("navigation login href", DjinniSelectors.LOGIN_ACTION_NAV_SELECTOR),
+            ("login CSS fallback", DjinniSelectors.LOGIN_ACTION_FALLBACK_SELECTOR),
+        ):
+            action = page.locator(selector)
+            count = await action.count()
+            if count > 1:
+                raise LoginUIError(f"Djinni {label} is ambiguous ({count} visible matches)")
             if count == 1 and await action.is_visible():
                 return action
         raise LoginUIError("Djinni homepage has no visible localized login action")
@@ -443,8 +514,11 @@ class DjinniSpider(scrapy.Spider):
         validation = page.locator(DjinniSelectors.LOGIN_ERROR_SELECTOR)
         challenge = page.locator(DjinniSelectors.LOGIN_CHALLENGE_SELECTOR)
         validation_text = await self._visible_text(validation)
+        login_candidates, visible_login_names = await self._login_action_candidates(page)
         return (
             f"url={self._safe_url(page.url)} "
+            f"login_action_candidates={login_candidates} "
+            f"visible_login_action_names={visible_login_names or 'none'} "
             f"login_form_visible={await self._is_visible(login_form)} "
             f"email_input_visible={await self._is_visible(email_input)} "
             f"password_input_visible={await self._is_visible(password_input)} "
@@ -452,6 +526,17 @@ class DjinniSpider(scrapy.Spider):
             f"challenge_detected={await self._is_visible(challenge)} "
             f"validation={self._safe_text(validation_text, email, password) if validation_text else 'none'}"
         )
+
+    async def _login_action_candidates(self, page):
+        """Returns safe, UI-only evidence when a login entry cannot be found."""
+        try:
+            candidates = page.locator(DjinniSelectors.LOGIN_ACTION_DIAGNOSTIC_SELECTOR)
+            count = await candidates.count()
+            names = await candidates.all_text_contents()
+        except PlaywrightError:
+            return "unknown", "unknown"
+        normalized_names = [self._safe_text(name, "", "") for name in names if name and name.strip()]
+        return count, ",".join(normalized_names[:5])
 
     @staticmethod
     async def _is_visible(locator):
@@ -579,6 +664,7 @@ class DjinniSpider(scrapy.Spider):
         next_page_url = self._get_next_page_url(response)
         if not next_page_url:
             self.logger.info("🛑 Наступної сторінки немає. Завершуємо парсинг.")
+            self._record_listing_completed()
             return
 
         next_page_element = response.css("li.page-item.active + li.page-item a.page-link")
@@ -607,13 +693,37 @@ class DjinniSpider(scrapy.Spider):
         next_page_link = response.css(
             "li.page-item.active + li.page-item:not(.disabled) a.page-link::attr(href)"
         ).get()
-        return urllib_urljoin(response.url, next_page_link) if next_page_link else None
+        if not next_page_link:
+            return None
+
+        next_page_url = urllib_urljoin(response.url, next_page_link)
+        current = urlsplit(response.url)
+        next_page = urlsplit(next_page_url)
+        next_query = parse_qsl(next_page.query, keep_blank_values=True)
+        next_page_values = [(key, value) for key, value in next_query if key == "page"]
+        current_query = parse_qsl(current.query, keep_blank_values=True)
+        # Djinni pagination links can contain only a subset of the active
+        # filters.  The profile URL is authoritative; pagination may change
+        # just the page number and must never silently narrow its filters.
+        preserved_query = [(key, value) for key, value in current_query if key != "page"]
+        merged_query = [*preserved_query, *next_page_values] if next_page_values else next_query
+        return urlunsplit(
+            (
+                next_page.scheme,
+                next_page.netloc,
+                next_page.path,
+                urlencode(merged_query, doseq=True),
+                next_page.fragment,
+            )
+        )
 
     async def errback_close_page(self, failure):
         """Закриває Playwright сторінку у випадку помилки."""
+        self._record_infrastructure_failure("playwright_request_error")
         page: Page = failure.request.meta.get("playwright_page")
         if page:
             await page.close()
             self.logger.warning("❌ Сторінка Playwright закрита через помилку.")
         else:
             self.logger.error("🚨 Помилка: не вдалося отримати `playwright_page` у `errback`.")
+        raise CloseSpider("Djinni Playwright jobs request failed")

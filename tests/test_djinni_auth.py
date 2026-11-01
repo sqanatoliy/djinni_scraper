@@ -126,6 +126,11 @@ class FakeLocator:
     async def text_content(self):
         return self.page.validation_text if self.kind == "login_error" else None
 
+    async def all_text_contents(self):
+        if self.kind == "homepage_login_action" and self.page.login_action_available:
+            return [self.page.login_label]
+        return []
+
 
 class FakePage:
     def __init__(
@@ -135,6 +140,7 @@ class FakePage:
         login_label="Увійти",
         login_role="link",
         login_action_available=True,
+        login_action_via_href=False,
         login_form_available=True,
         email_available=True,
         password_available=True,
@@ -144,6 +150,8 @@ class FakePage:
         non_native_submit=False,
         fail_authentication=False,
         validation_text=None,
+        challenge_detected=False,
+        homepage_final_url=None,
         fillable=None,
         retain_values=None,
         fail_storage_state=False,
@@ -157,6 +165,7 @@ class FakePage:
         self.login_label = login_label
         self.login_role = login_role
         self.login_action_available = login_action_available
+        self.login_action_via_href = login_action_via_href
         self.login_form_available = login_form_available
         self.email_available = email_available
         self.password_available = password_available
@@ -166,6 +175,8 @@ class FakePage:
         self.non_native_submit = non_native_submit
         self.fail_authentication = fail_authentication
         self.validation_text = validation_text
+        self.challenge_detected = challenge_detected
+        self.homepage_final_url = homepage_final_url
         self.login_ui_visible = False
         self.fillable = fillable or {}
         self.retain_values = retain_values or {}
@@ -186,6 +197,7 @@ class FakePage:
             login_label=self.login_label,
             login_role=self.login_role,
             login_action_available=self.login_action_available,
+            login_action_via_href=self.login_action_via_href,
             login_form_available=self.login_form_available,
             email_available=self.email_available,
             password_available=self.password_available,
@@ -195,6 +207,8 @@ class FakePage:
             non_native_submit=self.non_native_submit,
             fail_authentication=self.fail_authentication,
             validation_text=self.validation_text,
+            challenge_detected=self.challenge_detected,
+            homepage_final_url=self.homepage_final_url,
             fillable=self.fillable,
             retain_values=self.retain_values,
             fail_storage_state=self.fail_storage_state,
@@ -211,7 +225,7 @@ class FakePage:
         assert self.is_auth_page
         assert wait_until == "domcontentloaded"
         self.goto_urls.append(url)
-        self.url = url
+        self.url = self.homepage_final_url or url
         self.homepage_loaded = True
         self.trace.append("goto-homepage")
 
@@ -223,6 +237,7 @@ class FakePage:
             self.is_auth_page
             and self.homepage_loaded
             and self.login_action_available
+            and not self.login_action_via_href
             and not self.authenticated
             and role == self.login_role
             and bool(name.fullmatch(self.login_label))
@@ -230,6 +245,14 @@ class FakePage:
         return FakeLocator(self, "homepage_login_action", fixed_count=1 if matches else 0)
 
     def locator(self, selector):
+        if selector in {
+            DjinniSelectors.LOGIN_ACTION_HREF_SELECTOR,
+            DjinniSelectors.LOGIN_ACTION_NAV_SELECTOR,
+            DjinniSelectors.LOGIN_ACTION_FALLBACK_SELECTOR,
+            DjinniSelectors.LOGIN_ACTION_DIAGNOSTIC_SELECTOR,
+        }:
+            matches = self.is_auth_page and self.homepage_loaded and self.login_action_available
+            return FakeLocator(self, "homepage_login_action", fixed_count=1 if matches else 0)
         if selector == DjinniSelectors.LOGIN_FORM_SELECTOR:
             return FakeLocator(self, "login_form")
         if selector == DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR:
@@ -262,7 +285,7 @@ class FakePage:
         if kind == "login_error":
             return int(bool(self.validation_text))
         if kind == "login_challenge":
-            return 0
+            return int(self.challenge_detected)
         return 0
 
     def locator_visible(self, kind):
@@ -276,6 +299,22 @@ class FakePage:
 
     def is_closed(self):
         return self.closed
+
+
+class FakeStats:
+    def __init__(self):
+        self.values = {}
+
+    def set_value(self, key, value):
+        self.values[key] = value
+
+    def get_value(self, key, default=None):
+        return self.values.get(key, default)
+
+
+class FakeCrawler:
+    def __init__(self):
+        self.stats = FakeStats()
 
 
 async def collect(async_generator):
@@ -328,7 +367,11 @@ def spider(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     ("fixture_name", "label"),
-    (("auth_home_uk.html", "Увійти"), ("auth_home_en.html", "Log In")),
+    (
+        ("auth_home_uk.html", "Увійти"),
+        ("auth_home_en.html", "Log In"),
+        ("auth_hire_en.html", "Sign In"),
+    ),
 )
 def test_login_entry_fixtures_offer_a_specific_localized_navigation_action(fixture_name, label):
     response = HtmlResponse(
@@ -356,6 +399,16 @@ def test_login_form_and_authenticated_navigation_fixtures_expose_semantic_contra
         body=(FIXTURES_DIR / "auth_validation_error.html").read_bytes(),
         encoding="utf-8",
     )
+    challenge_response = HtmlResponse(
+        url="https://djinni.co/login",
+        body=(FIXTURES_DIR / "auth_challenge.html").read_bytes(),
+        encoding="utf-8",
+    )
+    hire_without_login_response = HtmlResponse(
+        url="https://djinni.co/hire",
+        body=(FIXTURES_DIR / "auth_hire_no_login.html").read_bytes(),
+        encoding="utf-8",
+    )
 
     assert login_response.css('input[name="email"]').get() is not None
     assert login_response.css('input[name="password"]').get() is not None
@@ -363,12 +416,14 @@ def test_login_form_and_authenticated_navigation_fixtures_expose_semantic_contra
     assert authenticated_response.css('a[href^="/my/inbox"]').get() is not None
     assert authenticated_response.css('a[href^="/logout"]').get() is not None
     assert error_response.css('[role="alert"]::text').get().strip() == "Invalid credentials"
+    assert challenge_response.css('[data-sitekey]').get() is not None
+    assert hire_without_login_response.css('a[href*="/login"]').get() is None
 
 
 def test_missing_state_uses_a_managed_initial_page_and_never_requests_direct_login(spider):
     initial_request = list(spider.start_requests())[0]
 
-    assert initial_request.url == spider.start_urls[0]
+    assert initial_request.url == DJINNI_HOME_URL
     assert initial_request.callback == spider.login
     assert "/login" not in initial_request.url
     assert initial_request.meta["auth_target_url"] == spider.start_urls[0]
@@ -398,7 +453,7 @@ def test_auth_flow_creates_only_a_new_page_in_the_existing_context():
     assert ".launch(" not in login_source
 
 
-@pytest.mark.parametrize("login_label", ("Увійти", "Log In"))
+@pytest.mark.parametrize("login_label", ("Увійти", "Log In", "Sign In"))
 def test_fresh_auth_tab_login_saves_state_and_resumes_jobs(spider, tmp_path, caplog, login_label):
     initial_page = FakePage(login_label=login_label, submit_label=login_label)
 
@@ -437,6 +492,35 @@ def test_fresh_auth_tab_login_saves_state_and_resumes_jobs(spider, tmp_path, cap
     assert "authentication confirmed" in caplog.text
     assert TEST_EMAIL not in caplog.text
     assert TEST_PASSWORD not in caplog.text
+
+
+def test_known_visible_login_href_is_used_after_role_name_lookup(spider):
+    initial_page = FakePage(
+        login_label="Access account",
+        login_action_via_href=True,
+        submit_label="Sign In",
+    )
+
+    resumed_request = asyncio.run(collect(spider.login(make_homepage_response(initial_page))))[0]
+
+    assert resumed_request.callback == spider.parse_jobs
+    assert initial_page.context.auth_page.clicked[0] == "homepage_login_action"
+
+
+def test_hire_auth_page_redirect_still_resumes_the_generated_profile_search_url(spider):
+    profile_spider = DjinniSpider(profile="python")
+    initial_page = FakePage(homepage_final_url="https://djinni.co/hire", login_label="Sign In", submit_label="Sign In")
+
+    resumed_request = asyncio.run(
+        collect(profile_spider.login(make_homepage_response(initial_page, target_url=profile_spider.start_urls[0])))
+    )[0]
+
+    auth_page = initial_page.context.auth_page
+    assert auth_page.goto_urls == [DJINNI_HOME_URL]
+    assert auth_page.homepage_final_url == "https://djinni.co/hire"
+    assert resumed_request.url == profile_spider.start_urls[0]
+    assert resumed_request.url.startswith("https://djinni.co/jobs/?search_type=basic-search")
+    assert resumed_request.url != auth_page.homepage_final_url
 
 
 def test_fresh_tab_sequence_order_regression(spider):
@@ -495,7 +579,7 @@ def test_stale_state_is_deleted_once_then_fresh_tab_login_resumes_original_jobs_
     )[0]
 
     assert not state_file.exists()
-    assert login_request.url == original_url
+    assert login_request.url == DJINNI_HOME_URL
     assert login_request.meta["auth_recovery_attempted"] is True
     assert login_request.meta["auth_target_url"] == original_url
     assert expired_page.closed is True
@@ -553,6 +637,19 @@ def test_failed_submit_logs_sanitized_validation_without_writing_state(spider, t
     assert not (tmp_path / STATE_FILE).exists()
     assert initial_page.closed is True
     assert initial_page.context.auth_page.closed is True
+
+
+def test_visible_challenge_is_an_auth_failure_without_writing_state(spider, tmp_path):
+    spider.crawler = FakeCrawler()
+    initial_page = FakePage(fail_authentication=True, challenge_detected=True)
+
+    with pytest.raises(CloseSpider) as error:
+        asyncio.run(collect(spider.login(make_homepage_response(initial_page))))
+
+    assert_close_reason(error, "rejected or remained anonymous")
+    assert not (tmp_path / STATE_FILE).exists()
+    assert initial_page.context.storage_state_paths == []
+    assert spider.crawler.stats.values["djinni/application_failure"] == "auth_challenge"
 
 
 def test_second_failed_session_validation_does_not_schedule_another_login(spider):

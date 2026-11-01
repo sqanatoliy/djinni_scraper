@@ -19,10 +19,10 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
@@ -102,11 +102,13 @@ jobs:
     - name: Wait before starting scraper (Cloudflare mitigation)
       run: sleep 5
 
-    - name: Mark SQLite mutation phase
-      id: vacancy-db-crawl
-      run: echo "started=true" >> "$GITHUB_OUTPUT"
+    - name: Confirm crawler prerequisites
+      id: crawler-prerequisites
+      run: echo "ready=true" >> "$GITHUB_OUTPUT"
 
     - name: Run Djinni scraper for PYTHON jobs
+      id: crawl-python
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
       env:
         DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
@@ -116,9 +118,11 @@ jobs:
         NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
         NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
-        scrapy crawl djinni -a profile=python
+        python scripts/run_djinni_profile.py --profile python
 
     - name: Run Djinni scraper for DATA Engineering jobs
+      id: crawl-data-engineer
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
       env:
         DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
@@ -128,9 +132,11 @@ jobs:
         NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
         NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
-        scrapy crawl djinni -a profile=data_engineer
+        python scripts/run_djinni_profile.py --profile data_engineer
 
     - name: Run Djinni scraper for OTHER category jobs
+      id: crawl-other
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
       env:
         DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
@@ -140,9 +146,11 @@ jobs:
         NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
         NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
-        scrapy crawl djinni -a profile=other
+        python scripts/run_djinni_profile.py --profile other
 
     - name: Run Djinni scraper for SUPPORT jobs
+      id: crawl-support
+      if: always() && steps.crawler-prerequisites.outputs.ready == 'true'
       env:
         DB_PATH: ./runtime/vacancies.db
         DJINNI_EMAIL: ${{ secrets.DJINNI_EMAIL }}
@@ -152,7 +160,7 @@ jobs:
         NO_EXP_TELEGRAM_TOKEN: ${{ secrets.NO_EXP_TELEGRAM_TOKEN }}
         NO_EXP_CHAT_ID: ${{ secrets.NO_EXP_CHAT_ID }}
       run: |
-        scrapy crawl djinni -a profile=support
+        python scripts/run_djinni_profile.py --profile support
 
     - name: Validate canonical SQLite state
       id: vacancy-db-state
@@ -167,8 +175,46 @@ jobs:
           exit 1
         fi
 
+    - name: Decide whether canonical SQLite state may be persisted
+      id: vacancy-db-crawl
+      if: always()
+      env:
+        RESTORED: ${{ steps.vacancy-db-restore.outputs.restored }}
+        PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}
+        DATA_ENGINEER_SUCCESS: ${{ steps.crawl-data-engineer.outputs.success }}
+        OTHER_SUCCESS: ${{ steps.crawl-other.outputs.success }}
+        SUPPORT_SUCCESS: ${{ steps.crawl-support.outputs.success }}
+        PYTHON_MUTATED: ${{ steps.crawl-python.outputs.state_mutated }}
+        DATA_ENGINEER_MUTATED: ${{ steps.crawl-data-engineer.outputs.state_mutated }}
+        OTHER_MUTATED: ${{ steps.crawl-other.outputs.state_mutated }}
+        SUPPORT_MUTATED: ${{ steps.crawl-support.outputs.state_mutated }}
+      run: |
+        set -euo pipefail
+        successful_profiles=0
+        mutated_profiles=0
+        for outcome in "$PYTHON_SUCCESS" "$DATA_ENGINEER_SUCCESS" "$OTHER_SUCCESS" "$SUPPORT_SUCCESS"; do
+          if [[ "$outcome" == "true" ]]; then
+            successful_profiles=$((successful_profiles + 1))
+          fi
+        done
+        for mutation in "$PYTHON_MUTATED" "$DATA_ENGINEER_MUTATED" "$OTHER_MUTATED" "$SUPPORT_MUTATED"; do
+          if [[ "$mutation" == "true" ]]; then
+            mutated_profiles=$((mutated_profiles + 1))
+          fi
+        done
+
+        upload=false
+        if [[ "$successful_profiles" -gt 0 && ( "$RESTORED" != "true" || "$mutated_profiles" -gt 0 ) ]]; then
+          upload=true
+        fi
+
+        echo "successful_profiles=$successful_profiles" >> "$GITHUB_OUTPUT"
+        echo "mutated_profiles=$mutated_profiles" >> "$GITHUB_OUTPUT"
+        echo "upload=$upload" >> "$GITHUB_OUTPUT"
+        echo "SQLite persistence decision: restored=$RESTORED successful_profiles=$successful_profiles mutated_profiles=$mutated_profiles upload=$upload"
+
     - name: Persist canonical SQLite state to Cloudflare R2
-      if: always() && steps.vacancy-db-crawl.outputs.started == 'true' && steps.vacancy-db-state.outputs.valid == 'true'
+      if: always() && steps.vacancy-db-crawl.outputs.upload == 'true' && steps.vacancy-db-state.outputs.valid == 'true'
       env:
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -185,3 +231,24 @@ jobs:
           "s3://$R2_BUCKET_NAME/$R2_DB_OBJECT_KEY" \
           --endpoint-url "$R2_ENDPOINT_URL" \
           --only-show-errors
+
+    - name: Fail workflow for unsuccessful Djinni profiles
+      if: always()
+      env:
+        PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}
+        DATA_ENGINEER_SUCCESS: ${{ steps.crawl-data-engineer.outputs.success }}
+        OTHER_SUCCESS: ${{ steps.crawl-other.outputs.success }}
+        SUPPORT_SUCCESS: ${{ steps.crawl-support.outputs.success }}
+      run: |
+        set -euo pipefail
+        failed_profiles=()
+        for profile in python data_engineer other support; do
+          success_var="$(echo "$profile" | tr '[:lower:]' '[:upper:]' | tr '-' '_')_SUCCESS"
+          if [[ "${!success_var}" != "true" ]]; then
+            failed_profiles+=("$profile")
+          fi
+        done
+        if [[ "${#failed_profiles[@]}" -gt 0 ]]; then
+          echo "Djinni profile runner failed or did not publish a successful outcome: ${failed_profiles[*]}" >&2
+          exit 2
+        fi
