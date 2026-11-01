@@ -1,8 +1,13 @@
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from scripts.run_djinni_profile import ExitCode, outcome_from_stats, write_github_outputs
+
+
+ROOT = Path(__file__).parents[1]
 
 
 def test_confirmed_zero_result_listing_is_a_successful_profile_outcome():
@@ -81,3 +86,16 @@ def test_runner_outputs_include_safe_outcome_markers_and_actual_counts(tmp_path)
         "items_persisted": "5",
         "state_mutated": "true",
     }
+
+
+def test_runner_is_directly_executable_from_the_repository_root():
+    result = subprocess.run(
+        [sys.executable, "scripts/run_djinni_profile.py", "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--profile" in result.stdout

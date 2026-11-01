@@ -12,10 +12,18 @@ import argparse
 import json
 import logging
 import os
+import sys
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Mapping
+
+# ``python scripts/run_djinni_profile.py`` puts ``scripts/`` rather than the
+# repository root on sys.path.  Make the documented GitHub Actions invocation
+# import the project package exactly as ``python -m`` would.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
