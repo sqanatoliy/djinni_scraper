@@ -782,7 +782,9 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     if current_version == 0 and not vacancy_columns:
         _create_new_v4_schema(connection)
         return
-    if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(vacancy_columns):
+    if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(
+        vacancy_columns
+    ):
         _migrate_v1_to_v2(connection)
         current_version = _V2_SCHEMA_VERSION
     if current_version == _V2_SCHEMA_VERSION:
@@ -796,6 +798,34 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     if current_version == SCHEMA_VERSION:
         _validate_v4_schema(connection)
         return
+    if current_version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"
+        )
+    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, v3, or v4")
+
+
+def validate_supported_schema(connection: sqlite3.Connection) -> int:
+    """Validates an existing database that repository initialization can open or migrate.
+
+    This deliberately does not create an empty schema or perform migrations, so
+    callers can inspect a downloaded state file before making it authoritative
+    local input.
+    """
+    current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
+
+    if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(vacancy_columns):
+        return current_version
+    if current_version == _V2_SCHEMA_VERSION:
+        _validate_v2_schema(connection)
+        return current_version
+    if current_version == _V3_SCHEMA_VERSION:
+        _validate_v3_schema(connection)
+        return current_version
+    if current_version == SCHEMA_VERSION:
+        _validate_v4_schema(connection)
+        return current_version
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"

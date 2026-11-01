@@ -57,15 +57,16 @@ Djinni HTML / JSON-LD
 
 ## SQLite і сповіщення
 
-- Runtime DB: `runtime/vacancies.db` (schema version 3).
+- Runtime DB: `runtime/vacancies.db` (schema version 4).
 - Одна logical vacancy визначається через `source + source_vacancy_id`; без stable ID використовується normalized URL fallback.
 - `vacancy_discoveries` зберігає profile provenance та timestamps першого/останнього виявлення.
-- `notification_outbox` створюється транзакційно разом з новою vacancy.
+- `vacancy_publications` зберігає history publication days, а `notification_outbox` транзакційно зберігає `INSERTED` і `REPUBLISHED` delivery state.
 
 Політика Telegram:
 
 ```text
 INSERTED       → notification event
+REPUBLISHED     → notification event
 UPDATED        → без нового повідомлення
 UNCHANGED      → без нового повідомлення
 discovery-only → без нового повідомлення
@@ -75,6 +76,14 @@ Routes `main` і `alternate` отримують credentials лише з environm
 
 ## GitHub Actions state
 
-Scheduled workflow послідовно запускає чотири formal profiles і зберігає `runtime/vacancies.db` через GitHub Actions cache. Це best-effort state: cache може бути evicted, тоді нова DB не матиме попередньої dedup history.
+`runtime/vacancies.db` — локальний runtime file. У GitHub Actions authoritative copy зберігається в Cloudflare R2 як:
+
+```text
+s3://$R2_BUCKET_NAME/production/vacancies.db
+```
+
+Hourly workflow виконує `restore → crawl → validate → persist`. Він відновлює object у temporary file, перевіряє SQLite перед використанням, а після profiles перевіряє `quick_check`, `foreign_key_check`, schema version 4 і required tables перед upload. Якщо object відсутній, це explicit first-run bootstrap; інші R2 failures зупиняють workflow, не створюючи fresh DB. GitHub Actions cache більше не використовується для application DB state.
+
+Для workflow потрібні лише names secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT_URL`, `R2_BUCKET_NAME`. Значення не зберігаються в repository або документації.
 
 `runtime/`, `state.json`, `.env`, SQLite backups, Python caches і `.DS_Store` не комітяться.

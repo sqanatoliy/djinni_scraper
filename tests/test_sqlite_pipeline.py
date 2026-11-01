@@ -210,8 +210,9 @@ def test_pipeline_has_no_legacy_formatter_or_inline_sql_and_workflow_keeps_runti
     assert "_legacy_telegram_data" not in pipeline_source
     assert "INSERT INTO" not in pipeline_source
     assert "DB_PATH: ./runtime/vacancies.db" in workflow
-    assert "actions/cache/restore@v4" in workflow
-    assert "actions/cache/save@v4" in workflow
+    assert "Restore canonical SQLite state from Cloudflare R2" in workflow
+    assert "Persist canonical SQLite state to Cloudflare R2" in workflow
+    assert "actions/cache" not in workflow
     assert "jobs.db" not in workflow
     assert "git add" not in workflow
     assert "git push" not in workflow

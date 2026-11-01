@@ -14,24 +14,77 @@ jobs:
   run_scraper:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    env:
+      R2_DB_OBJECT_KEY: production/vacancies.db
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
 
-    - name: Restore canonical SQLite state
-      id: vacancy-db-restore
-      uses: actions/cache/restore@v4
-      with:
-        path: runtime/vacancies.db
-        key: djinni-vacancies-db-v1-${{ github.run_id }}-${{ github.run_attempt }}
-        restore-keys: |
-          djinni-vacancies-db-v1-
-
     - name: Set up Python
       uses: actions/setup-python@v3
       with:
         python-version: '3.11'
+
+    - name: Ensure AWS CLI is available
+      run: |
+        if ! command -v aws >/dev/null 2>&1; then
+          python -m pip install --upgrade awscli
+        fi
+        aws --version
+
+    - name: Restore canonical SQLite state from Cloudflare R2
+      id: vacancy-db-restore
+      env:
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: auto
+        AWS_EC2_METADATA_DISABLED: "true"
+      run: |
+        set -euo pipefail
+        mkdir -p runtime
+        database_path=runtime/vacancies.db
+        temporary_path=runtime/vacancies.db.download
+        head_error="$(mktemp)"
+        trap 'rm -f "$temporary_path" "$head_error"' EXIT
+
+        aws s3api head-bucket \
+          --bucket "$R2_BUCKET_NAME" \
+          --endpoint-url "$R2_ENDPOINT_URL" \
+          >/dev/null
+
+        if aws s3api head-object \
+          --bucket "$R2_BUCKET_NAME" \
+          --key "$R2_DB_OBJECT_KEY" \
+          --endpoint-url "$R2_ENDPOINT_URL" \
+          >/dev/null 2>"$head_error"; then
+          aws s3 cp \
+            "s3://$R2_BUCKET_NAME/$R2_DB_OBJECT_KEY" \
+            "$temporary_path" \
+            --endpoint-url "$R2_ENDPOINT_URL" \
+            --only-show-errors
+          python scripts/validate_sqlite_state.py --allow-supported-schema "$temporary_path"
+          mv "$temporary_path" "$database_path"
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+          echo "Restored SQLite state from Cloudflare R2."
+        else
+          status=$?
+          if grep -Eq 'NoSuchKey|404|Not Found' "$head_error"; then
+            if [[ -e "$database_path" ]]; then
+              echo "R2 state object is absent while local SQLite state exists; refusing unsafe bootstrap." >&2
+              exit 1
+            fi
+            echo "R2 state object not found; starting with a fresh database"
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "R2 state-object probe failed; refusing to bootstrap a fresh database." >&2
+            exit "$status"
+          fi
+        fi
 
     - name: Install dependencies
       run: |
@@ -48,6 +101,10 @@ jobs:
 
     - name: Wait before starting scraper (Cloudflare mitigation)
       run: sleep 5
+
+    - name: Mark SQLite mutation phase
+      id: vacancy-db-crawl
+      run: echo "started=true" >> "$GITHUB_OUTPUT"
 
     - name: Run Djinni scraper for PYTHON jobs
       env:
@@ -103,40 +160,28 @@ jobs:
       env:
         DB_PATH: ./runtime/vacancies.db
       run: |
-        python - "$DB_PATH" <<'PY'
-        import os
-        import sqlite3
-        import sys
-        from pathlib import Path
+        if python scripts/validate_sqlite_state.py --require-current-schema "$DB_PATH"; then
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "valid=false" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
 
-        database_path = Path(sys.argv[1]).resolve()
-        is_valid = False
-        try:
-            with sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True) as connection:
-                quick_check = connection.execute("PRAGMA quick_check;").fetchone()
-                schema_version = connection.execute("PRAGMA user_version;").fetchone()
-                vacancies_table = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vacancies';"
-                ).fetchone()
-                outbox_table = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox';"
-                ).fetchone()
-                is_valid = (
-                    quick_check == ("ok",)
-                    and schema_version == (3,)
-                    and vacancies_table == (1,)
-                    and outbox_table == (1,)
-                )
-        except (OSError, sqlite3.Error):
-            pass
-
-        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            output.write(f"valid={'true' if is_valid else 'false'}\\n")
-        PY
-
-    - name: Save canonical SQLite state
-      if: always() && steps.vacancy-db-state.outputs.valid == 'true'
-      uses: actions/cache/save@v4
-      with:
-        path: runtime/vacancies.db
-        key: ${{ steps.vacancy-db-restore.outputs.cache-primary-key }}
+    - name: Persist canonical SQLite state to Cloudflare R2
+      if: always() && steps.vacancy-db-crawl.outputs.started == 'true' && steps.vacancy-db-state.outputs.valid == 'true'
+      env:
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: auto
+        AWS_EC2_METADATA_DISABLED: "true"
+      run: |
+        set -euo pipefail
+        aws s3 cp \
+          ./runtime/vacancies.db \
+          "s3://$R2_BUCKET_NAME/$R2_DB_OBJECT_KEY" \
+          --endpoint-url "$R2_ENDPOINT_URL" \
+          --only-show-errors
