@@ -16,13 +16,16 @@ from urllib.parse import urlsplit, urlunsplit
 from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequirement, Location, Vacancy
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _V1_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
+_V3_SCHEMA_VERSION = 3
 VACANCIES_TABLE = "vacancies"
 DISCOVERIES_TABLE = "vacancy_discoveries"
+PUBLICATIONS_TABLE = "vacancy_publications"
 OUTBOX_TABLE = "notification_outbox"
 VACANCY_INSERTED_EVENT = "VACANCY_INSERTED"
+VACANCY_REPUBLISHED_EVENT = "VACANCY_REPUBLISHED"
 
 _V1_CANONICAL_COLUMNS = frozenset(
     {
@@ -60,7 +63,10 @@ _V2_CANONICAL_COLUMNS = (
 _DISCOVERY_COLUMNS = frozenset(
     {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"}
 )
-_OUTBOX_COLUMNS = frozenset(
+_PUBLICATION_COLUMNS = frozenset(
+    {"id", "vacancy_id", "published_at", "first_observed_at", "last_observed_at"}
+)
+_V3_OUTBOX_COLUMNS = frozenset(
     {
         "id",
         "vacancy_id",
@@ -75,6 +81,7 @@ _OUTBOX_COLUMNS = frozenset(
         "last_error",
     }
 )
+_OUTBOX_COLUMNS = _V3_OUTBOX_COLUMNS | {"publication_id", "event_key"}
 _CONTENT_FIELDS = (
     "url",
     "title",
@@ -89,7 +96,6 @@ _CONTENT_FIELDS = (
     "industry",
     "tags",
     "language_requirements",
-    "published_at",
     "valid_through",
 )
 
@@ -98,6 +104,7 @@ class PersistenceStatus(str, Enum):
     """Canonical-content outcome for one observed vacancy."""
 
     INSERTED = "INSERTED"
+    REPUBLISHED = "REPUBLISHED"
     UPDATED = "UPDATED"
     UNCHANGED = "UNCHANGED"
 
@@ -109,6 +116,8 @@ class PersistenceResult:
     status: PersistenceStatus
     vacancy_id: int
     discovery_added: bool
+    publication_added: bool = False
+    publication_id: int | None = None
     notification_enqueued: bool = False
     notification_event_id: int | None = None
 
@@ -128,8 +137,19 @@ class VacancyDiscovery:
 
 
 @dataclass(frozen=True, slots=True)
+class VacancyPublication:
+    """One normalized Djinni publication day for a logical vacancy."""
+
+    id: int
+    vacancy_id: int
+    published_at: str
+    first_observed_at: datetime
+    last_observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class NotificationIntent:
-    """Observation-local routing metadata captured only for a new vacancy event."""
+    """Observation-local routing metadata for a notification-eligible event."""
 
     route: str
     profile_slug: str | None = None
@@ -150,7 +170,9 @@ class NotificationOutboxEvent:
 
     id: int
     vacancy_id: int
+    publication_id: int | None
     event_type: str
+    event_key: str
     route: str
     profile_slug: str | None
     created_at: datetime
@@ -214,21 +236,55 @@ class SQLiteVacancyRepository:
             vacancy.discovery_profiles if discovery_profiles is None else discovery_profiles
         )
         record = vacancy_to_record(vacancy)
+        publication_day = normalize_publication_day(vacancy.published_at)
 
         try:
             connection.execute("BEGIN")
             existing_row, promoted = self._resolve_existing_observation(connection, vacancy)
+            publication_id = None
+            publication_added = False
+            republished = False
             if existing_row is None:
                 vacancy_id = self._insert_vacancy_row(connection, record, observed_at_text)
                 status = PersistenceStatus.INSERTED
+                if publication_day is not None:
+                    publication_id = self._insert_publication(
+                        connection,
+                        vacancy_id=vacancy_id,
+                        publication_day=publication_day,
+                        observed_at=observed_at_text,
+                    )
+                    publication_added = True
             else:
                 vacancy_id = existing_row["id"]
                 status = PersistenceStatus.UNCHANGED
                 if promoted:
                     self._promote_fallback_identity(connection, vacancy_id, record)
-                if observation_complete and existing_row["content_hash"] != record["content_hash"]:
+                had_publication_history = self._has_publication_history(connection, vacancy_id)
+                if publication_day is not None:
+                    publication_id, publication_added, republished = self._observe_publication(
+                        connection,
+                        vacancy_id=vacancy_id,
+                        publication_day=publication_day,
+                        observed_at=observed_at_text,
+                        had_publication_history=had_publication_history,
+                    )
+
+                historical_publication = publication_added and had_publication_history and not republished
+                content_changed = existing_row["content_hash"] != record["content_hash"]
+                baseline_date_became_known = (
+                    publication_added
+                    and not had_publication_history
+                    and existing_row["published_at"] is None
+                )
+                if republished:
+                    status = PersistenceStatus.REPUBLISHED
+                if observation_complete and not historical_publication and (
+                    content_changed or republished or baseline_date_became_known
+                ):
                     self._update_vacancy_row(connection, vacancy_id, record, observed_at_text)
-                    status = PersistenceStatus.UPDATED
+                    if not republished:
+                        status = PersistenceStatus.UPDATED
                 else:
                     self._touch_last_seen(connection, vacancy_id, observed_at_text)
 
@@ -239,10 +295,19 @@ class SQLiteVacancyRepository:
                 observed_at=observed_at_text,
             )
             notification_event_id = None
-            if status is PersistenceStatus.INSERTED and notification_intent is not None:
+            if (
+                status in (PersistenceStatus.INSERTED, PersistenceStatus.REPUBLISHED)
+                and notification_intent is not None
+            ):
                 notification_event_id = self._enqueue_notification(
                     connection,
                     vacancy_id=vacancy_id,
+                    publication_id=publication_id if status is PersistenceStatus.REPUBLISHED else None,
+                    event_type=(
+                        VACANCY_INSERTED_EVENT
+                        if status is PersistenceStatus.INSERTED
+                        else VACANCY_REPUBLISHED_EVENT
+                    ),
                     notification_intent=notification_intent,
                     created_at=observed_at_text,
                 )
@@ -255,6 +320,8 @@ class SQLiteVacancyRepository:
             status=status,
             vacancy_id=vacancy_id,
             discovery_added=discovery_added,
+            publication_added=publication_added,
+            publication_id=publication_id,
             notification_enqueued=notification_event_id is not None,
             notification_event_id=notification_event_id,
         )
@@ -300,6 +367,36 @@ class SQLiteVacancyRepository:
             "SELECT * FROM notification_outbox WHERE id = ?", (event_id,)
         ).fetchone()
         return _row_to_outbox_event(row) if row else None
+
+    def get_publication(self, publication_id: int) -> VacancyPublication | None:
+        """Reads one publication occurrence for event-specific presentation."""
+        row = self._require_connection().execute(
+            """
+            SELECT id, vacancy_id, published_at, first_observed_at, last_observed_at
+            FROM vacancy_publications
+            WHERE id = ?
+            """,
+            (publication_id,),
+        ).fetchone()
+        return _row_to_publication(row) if row else None
+
+    def list_publications(self, vacancy_id: int) -> tuple[VacancyPublication, ...]:
+        """Returns deterministic publication history for one logical vacancy."""
+        rows = self._require_connection().execute(
+            """
+            SELECT id, vacancy_id, published_at, first_observed_at, last_observed_at
+            FROM vacancy_publications
+            WHERE vacancy_id = ?
+            ORDER BY published_at, id
+            """,
+            (vacancy_id,),
+        )
+        return tuple(_row_to_publication(row) for row in rows)
+
+    def get_latest_publication(self, vacancy_id: int) -> VacancyPublication | None:
+        """Returns the latest known normalized publication day, if one exists."""
+        publications = self.list_publications(vacancy_id)
+        return max(publications, key=lambda publication: publication.published_at, default=None)
 
     def list_due_notification_events(
         self, *, now: datetime, limit: int
@@ -371,6 +468,50 @@ class SQLiteVacancyRepository:
     def get_discovery_profiles(self, vacancy_id: int) -> tuple[str, ...]:
         """Returns profile slugs for callers that do not need timestamps."""
         return tuple(discovery.profile_slug for discovery in self.get_discoveries(vacancy_id))
+
+    @staticmethod
+    def _has_publication_history(connection: sqlite3.Connection, vacancy_id: int) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM vacancy_publications WHERE vacancy_id = ? LIMIT 1", (vacancy_id,)
+        ).fetchone() is not None
+
+    def _observe_publication(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        vacancy_id: int,
+        publication_day: str,
+        observed_at: str,
+        had_publication_history: bool,
+    ) -> tuple[int, bool, bool]:
+        """Stores one normalized publication day and returns ``(id, added, republished)``."""
+        existing = connection.execute(
+            """
+            SELECT id FROM vacancy_publications
+            WHERE vacancy_id = ? AND published_at = ?
+            """,
+            (vacancy_id, publication_day),
+        ).fetchone()
+        if existing is not None:
+            connection.execute(
+                """
+                UPDATE vacancy_publications
+                SET last_observed_at = ?
+                WHERE id = ?
+                """,
+                (observed_at, existing["id"]),
+            )
+            return existing["id"], False, False
+
+        latest = self.get_latest_publication(vacancy_id) if had_publication_history else None
+        publication_id = self._insert_publication(
+            connection,
+            vacancy_id=vacancy_id,
+            publication_day=publication_day,
+            observed_at=observed_at,
+        )
+        republished = latest is not None and publication_day > latest.published_at
+        return publication_id, True, republished
 
     def _resolve_existing_observation(
         self, connection: sqlite3.Connection, vacancy: Vacancy
@@ -494,6 +635,24 @@ class SQLiteVacancyRepository:
         )
 
     @staticmethod
+    def _insert_publication(
+        connection: sqlite3.Connection,
+        *,
+        vacancy_id: int,
+        publication_day: str,
+        observed_at: str,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            INSERT INTO vacancy_publications (
+                vacancy_id, published_at, first_observed_at, last_observed_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (vacancy_id, publication_day, observed_at, observed_at),
+        )
+        return cursor.lastrowid
+
+    @staticmethod
     def _merge_discoveries(
         connection: sqlite3.Connection,
         *,
@@ -536,18 +695,28 @@ class SQLiteVacancyRepository:
         connection: sqlite3.Connection,
         *,
         vacancy_id: int,
+        publication_id: int | None,
+        event_type: str,
         notification_intent: NotificationIntent,
         created_at: str,
     ) -> int:
+        if event_type == VACANCY_INSERTED_EVENT:
+            event_key = f"vacancy:{vacancy_id}:inserted"
+        elif event_type == VACANCY_REPUBLISHED_EVENT and publication_id is not None:
+            event_key = f"publication:{publication_id}:republished"
+        else:
+            raise ValueError("notification event requires a supported event type and identity")
         cursor = connection.execute(
             """
             INSERT INTO notification_outbox (
-                vacancy_id, event_type, route, profile_slug, created_at
-            ) VALUES (?, ?, ?, ?, ?)
+                vacancy_id, publication_id, event_type, event_key, route, profile_slug, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 vacancy_id,
-                VACANCY_INSERTED_EVENT,
+                publication_id,
+                event_type,
+                event_key,
                 notification_intent.route,
                 notification_intent.profile_slug,
                 created_at,
@@ -605,13 +774,13 @@ class SQLiteVacancyRepository:
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Creates schema v3 or migrates canonical v1/v2 databases in place."""
+    """Creates schema v4 or migrates canonical v1/v2/v3 databases in place."""
     connection.execute("PRAGMA foreign_keys = ON")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
 
     if current_version == 0 and not vacancy_columns:
-        _create_new_v3_schema(connection)
+        _create_new_v4_schema(connection)
         return
     if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(vacancy_columns):
         _migrate_v1_to_v2(connection)
@@ -619,25 +788,30 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     if current_version == _V2_SCHEMA_VERSION:
         _validate_v2_schema(connection)
         _migrate_v2_to_v3(connection)
+        current_version = _V3_SCHEMA_VERSION
+    if current_version == _V3_SCHEMA_VERSION:
+        _validate_v3_schema(connection)
+        _migrate_v3_to_v4(connection)
         return
     if current_version == SCHEMA_VERSION:
-        _validate_v3_schema(connection)
+        _validate_v4_schema(connection)
         return
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"
         )
-    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, or v3")
+    raise RuntimeError("Existing vacancies table is not canonical schema v1, v2, v3, or v4")
 
 
-def _create_new_v3_schema(connection: sqlite3.Connection) -> None:
+def _create_new_v4_schema(connection: sqlite3.Connection) -> None:
     try:
         connection.execute("BEGIN")
         _create_vacancies_table(connection)
         _create_discoveries_table(connection)
+        _create_publications_table(connection)
         _create_outbox_table(connection)
         _create_v2_indexes(connection)
-        _create_v3_indexes(connection)
+        _create_outbox_indexes(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -763,7 +937,48 @@ def _create_discoveries_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_publications_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE vacancy_publications (
+            id INTEGER PRIMARY KEY,
+            vacancy_id INTEGER NOT NULL,
+            published_at TEXT NOT NULL,
+            first_observed_at TEXT NOT NULL,
+            last_observed_at TEXT NOT NULL,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            UNIQUE (vacancy_id, published_at)
+        )
+        """
+    )
+
+
 def _create_outbox_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE notification_outbox (
+            id INTEGER PRIMARY KEY,
+            vacancy_id INTEGER NOT NULL,
+            publication_id INTEGER,
+            event_type TEXT NOT NULL,
+            event_key TEXT NOT NULL UNIQUE,
+            route TEXT NOT NULL,
+            profile_slug TEXT,
+            created_at TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
+            next_attempt_at TEXT,
+            delivered_at TEXT,
+            last_error TEXT,
+            FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE,
+            FOREIGN KEY (publication_id) REFERENCES vacancy_publications(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _create_v3_outbox_table(connection: sqlite3.Connection) -> None:
+    """Creates the legacy v3 outbox only while migrating an older database."""
     connection.execute(
         """
         CREATE TABLE notification_outbox (
@@ -797,7 +1012,7 @@ def _create_v2_indexes(connection: sqlite3.Connection) -> None:
     )
 
 
-def _create_v3_indexes(connection: sqlite3.Connection) -> None:
+def _create_outbox_indexes(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         CREATE INDEX idx_notification_outbox_pending
@@ -822,9 +1037,9 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     """Adds an empty transactional outbox without inventing historical notifications."""
     try:
         connection.execute("BEGIN")
-        _create_outbox_table(connection)
-        _create_v3_indexes(connection)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _create_v3_outbox_table(connection)
+        _create_outbox_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {_V3_SCHEMA_VERSION}")
         connection.commit()
     except Exception:
         connection.rollback()
@@ -834,8 +1049,83 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
 def _validate_v3_schema(connection: sqlite3.Connection) -> None:
     _validate_v2_schema(connection)
     outbox_columns = _table_columns(connection, OUTBOX_TABLE)
-    if not _OUTBOX_COLUMNS.issubset(outbox_columns):
+    if not _V3_OUTBOX_COLUMNS.issubset(outbox_columns):
         raise RuntimeError("Existing database is marked schema v3 but does not match the notification outbox schema")
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Adds publication history and generic outbox identity without replaying notifications."""
+    legacy_outbox_table = "notification_outbox_v3"
+    try:
+        connection.execute("BEGIN")
+        connection.execute(f"ALTER TABLE {OUTBOX_TABLE} RENAME TO {legacy_outbox_table}")
+        for index_name in (
+            "idx_notification_outbox_pending",
+            "idx_notification_outbox_vacancy_id",
+        ):
+            connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+        _create_publications_table(connection)
+
+        vacancy_rows = list(connection.execute("SELECT * FROM vacancies ORDER BY id"))
+        for row in vacancy_rows:
+            vacancy = row_to_vacancy(row)
+            connection.execute(
+                "UPDATE vacancies SET content_hash = ? WHERE id = ?",
+                (vacancy_content_hash(vacancy), row["id"]),
+            )
+            publication_day = normalize_publication_day(vacancy.published_at)
+            if publication_day is not None:
+                connection.execute(
+                    """
+                    INSERT INTO vacancy_publications (
+                        vacancy_id, published_at, first_observed_at, last_observed_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (row["id"], publication_day, row["first_seen_at"], row["last_seen_at"]),
+                )
+
+        _create_outbox_table(connection)
+        legacy_events = list(connection.execute(f"SELECT * FROM {legacy_outbox_table} ORDER BY id"))
+        for event in legacy_events:
+            connection.execute(
+                """
+                INSERT INTO notification_outbox (
+                    id, vacancy_id, publication_id, event_type, event_key, route, profile_slug,
+                    created_at, attempt_count, last_attempt_at, next_attempt_at, delivered_at, last_error
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["id"],
+                    event["vacancy_id"],
+                    event["event_type"],
+                    _legacy_outbox_event_key(event),
+                    event["route"],
+                    event["profile_slug"],
+                    event["created_at"],
+                    event["attempt_count"],
+                    event["last_attempt_at"],
+                    event["next_attempt_at"],
+                    event["delivered_at"],
+                    event["last_error"],
+                ),
+            )
+        connection.execute(f"DROP TABLE {legacy_outbox_table}")
+        _create_outbox_indexes(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _validate_v4_schema(connection: sqlite3.Connection) -> None:
+    _validate_v2_schema(connection)
+    publication_columns = _table_columns(connection, PUBLICATIONS_TABLE)
+    outbox_columns = _table_columns(connection, OUTBOX_TABLE)
+    if not _PUBLICATION_COLUMNS.issubset(publication_columns) or not _OUTBOX_COLUMNS.issubset(
+        outbox_columns
+    ):
+        raise RuntimeError("Existing database is marked schema v4 but does not match publication/outbox schema")
 
 
 def vacancy_identity_key(vacancy: Vacancy) -> str:
@@ -888,7 +1178,7 @@ def vacancy_to_record(vacancy: Vacancy) -> dict[str, Any]:
         "industry": data["industry"],
         "tags_json": _json_dump(data["tags"]),
         "language_requirements_json": _json_dump(data["language_requirements"]),
-        "published_at": data["published_at"],
+        "published_at": normalize_publication_timestamp(vacancy.published_at),
         "valid_through": data["valid_through"],
         "scraped_at": data["scraped_at"],
         "raw_source_metadata_json": _json_dump(data["raw_source_metadata"]),
@@ -932,7 +1222,9 @@ def _row_to_outbox_event(row: Mapping[str, Any]) -> NotificationOutboxEvent:
     return NotificationOutboxEvent(
         id=row["id"],
         vacancy_id=row["vacancy_id"],
+        publication_id=row["publication_id"],
         event_type=row["event_type"],
+        event_key=row["event_key"],
         route=row["route"],
         profile_slug=row["profile_slug"],
         created_at=_parse_datetime(row["created_at"]),
@@ -942,6 +1234,22 @@ def _row_to_outbox_event(row: Mapping[str, Any]) -> NotificationOutboxEvent:
         delivered_at=_parse_optional_datetime(row["delivered_at"]),
         last_error=row["last_error"],
     )
+
+
+def _row_to_publication(row: Mapping[str, Any]) -> VacancyPublication:
+    return VacancyPublication(
+        id=row["id"],
+        vacancy_id=row["vacancy_id"],
+        published_at=row["published_at"],
+        first_observed_at=_parse_datetime(row["first_observed_at"]),
+        last_observed_at=_parse_datetime(row["last_observed_at"]),
+    )
+
+
+def _legacy_outbox_event_key(event: Mapping[str, Any]) -> str:
+    if event["event_type"] == VACANCY_INSERTED_EVENT:
+        return f"vacancy:{event['vacancy_id']}:inserted"
+    return f"vacancy:{event['vacancy_id']}:{str(event['event_type']).casefold()}"
 
 
 def _v1_row_to_vacancy(row: Mapping[str, Any]) -> Vacancy:
@@ -972,6 +1280,37 @@ def _normalized_identity_url(url: str) -> str:
     parsed = urlsplit(url.strip())
     path = parsed.path.rstrip("/") or "/"
     return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+
+
+def normalize_publication_timestamp(value: date | datetime | None) -> str | None:
+    """Preserves source date/datetime precision in one non-null ISO representation."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    raise ValueError("published_at must be a date, datetime, or None")
+
+
+def normalize_publication_day(value: date | datetime | None) -> str | None:
+    """Returns Djinni's publication-occurrence key without changing source display precision.
+
+    Djinni's detail JSON-LD and listing fallback expose different timestamp
+    precisions, so a calendar day is the reliable repost signal.  Naive values
+    retain their source calendar date; offset-aware values use the UTC date so
+    equivalent instants get the same deterministic key without consulting the
+    host timezone.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            return value.astimezone(timezone.utc).date().isoformat()
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    raise ValueError("published_at must be a date, datetime, or None")
 
 
 def _normalized_profiles(profiles: Iterable[str]) -> tuple[str, ...]:

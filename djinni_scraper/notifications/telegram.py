@@ -31,9 +31,17 @@ def escape_markdown_v2(value: object) -> str:
     return re.sub(f"([{re.escape(_MARKDOWN_V2_CHARS)}])", r"\\\1", text)
 
 
-def format_vacancy_notification(vacancy: Vacancy) -> str:
-    """Builds a compact MarkdownV2 message only from canonical Vacancy fields."""
-    lines = ["*DJINNI\\.CO*", f"*{escape_markdown_v2(_clip(vacancy.title, _FIELD_LIMIT))}*"]
+def format_vacancy_notification(
+    vacancy: Vacancy,
+    *,
+    event_type: str | None = None,
+    publication_published_at: str | None = None,
+) -> str:
+    """Builds a compact MarkdownV2 message from canonical Vacancy plus event context."""
+    lines = []
+    if event_type == "VACANCY_REPUBLISHED":
+        lines.append("🔄 *Повторно опублікована вакансія*")
+    lines.extend(["*DJINNI\\.CO*", f"*{escape_markdown_v2(_clip(vacancy.title, _FIELD_LIMIT))}*"])
     _append_field(lines, "Компанія", _company_text(vacancy))
     _append_field(lines, "Винагорода", _compensation_text(vacancy.compensation))
     _append_field(lines, "Досвід", _experience_text(vacancy.experience_months))
@@ -44,7 +52,12 @@ def format_vacancy_notification(vacancy: Vacancy) -> str:
     _append_field(lines, "Індустрія", vacancy.industry)
     _append_field(lines, "Теги", ", ".join(vacancy.tags) if vacancy.tags else None)
     _append_field(lines, "Мови", _languages_text(vacancy))
-    _append_field(lines, "Опубліковано", _date_text(vacancy.published_at))
+    displayed_published_at = (
+        publication_published_at
+        if event_type == "VACANCY_REPUBLISHED" and publication_published_at is not None
+        else vacancy.published_at
+    )
+    _append_field(lines, "Опубліковано", _date_text(displayed_published_at))
     if vacancy.description:
         _append_field(lines, "Опис", _description_text(vacancy.description))
     lines.append(f"[Відкрити вакансію]({_escape_link_url(vacancy.url)})")
@@ -132,7 +145,9 @@ def _languages_text(vacancy: Vacancy) -> str | None:
     return ", ".join(values) if values else None
 
 
-def _date_text(value: date | datetime | None) -> str | None:
+def _date_text(value: date | datetime | str | None) -> str | None:
+    if isinstance(value, str):
+        return value
     return value.isoformat() if value is not None else None
 
 

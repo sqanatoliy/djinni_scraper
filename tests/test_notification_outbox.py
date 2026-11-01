@@ -178,13 +178,14 @@ def test_v2_to_v3_migration_preserves_rows_discoveries_and_does_not_backfill_not
     repo = SQLiteVacancyRepository(db_path)
     repo.open()
 
-    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
     assert repo.connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
     assert repo.get_discovery_profiles(1) == ("python",)
+    assert [publication.published_at for publication in repo.list_publications(1)] == ["2026-08-12"]
     assert repo.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
     repo.close()
     repo.open()
-    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
     repo.close()
 
 
@@ -193,7 +194,7 @@ def test_v2_to_v3_migration_failure_rolls_back_without_dropping_v2_state(tmp_pat
     create_v2_database(db_path)
     monkeypatch.setattr(
         sqlite_module,
-        "_create_outbox_table",
+        "_create_v3_outbox_table",
         lambda _connection: (_ for _ in ()).throw(sqlite3.OperationalError("outbox migration failed")),
     )
 
@@ -212,6 +213,139 @@ def test_v2_to_v3_migration_failure_rolls_back_without_dropping_v2_state(tmp_pat
         connection.close()
 
 
+V3_OUTBOX_SCHEMA = """
+CREATE TABLE notification_outbox (
+    id INTEGER PRIMARY KEY,
+    vacancy_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    route TEXT NOT NULL,
+    profile_slug TEXT,
+    created_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    next_attempt_at TEXT,
+    delivered_at TEXT,
+    last_error TEXT,
+    UNIQUE (vacancy_id, event_type),
+    FOREIGN KEY (vacancy_id) REFERENCES vacancies(id) ON DELETE CASCADE
+)
+"""
+
+
+def create_v3_database(path: Path) -> None:
+    create_v2_database(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(V3_OUTBOX_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO notification_outbox (
+                id, vacancy_id, event_type, route, profile_slug, created_at, attempt_count,
+                last_attempt_at, next_attempt_at, delivered_at, last_error
+            ) VALUES (7, 1, 'VACANCY_INSERTED', 'main', 'python', ?, 2, ?, NULL, ?, NULL)
+            """,
+            (NOW.isoformat(), NOW.isoformat(), LATER.isoformat()),
+        )
+        connection.execute("UPDATE vacancies SET content_hash = 'obsolete-v3-hash' WHERE id = 1")
+        connection.execute(
+            """
+            CREATE INDEX idx_notification_outbox_pending
+            ON notification_outbox (delivered_at, next_attempt_at, created_at, id)
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_notification_outbox_vacancy_id ON notification_outbox (vacancy_id)"
+        )
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v3_to_v4_migration_preserves_state_backfills_publications_and_rekeys_outbox(tmp_path):
+    db_path = tmp_path / "v3.db"
+    create_v3_database(db_path)
+
+    repo = SQLiteVacancyRepository(db_path)
+    repo.open()
+    event = repo.get_notification_event(7)
+
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repo.connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
+    assert repo.get_discovery_profiles(1) == ("python",)
+    assert [publication.published_at for publication in repo.list_publications(1)] == ["2026-08-12"]
+    assert event.id == 7
+    assert event.event_key == "vacancy:1:inserted"
+    assert event.publication_id is None
+    assert event.attempt_count == 2
+    assert event.delivered_at == LATER
+    assert repo.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
+    assert {
+        "idx_notification_outbox_pending",
+        "idx_notification_outbox_vacancy_id",
+    }.issubset({row[1] for row in repo.connection.execute("PRAGMA index_list(notification_outbox)")})
+    assert repo.connection.execute("SELECT content_hash FROM vacancies WHERE id = 1").fetchone()[0] == vacancy_to_record(vacancy())["content_hash"]
+
+    repo.close()
+    repo.open()
+    assert repo.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert repo.connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 1
+    repo.close()
+
+
+def test_v3_to_v4_failure_rolls_back_to_valid_v3(tmp_path, monkeypatch):
+    db_path = tmp_path / "v3-failure.db"
+    create_v3_database(db_path)
+    monkeypatch.setattr(
+        sqlite_module,
+        "_create_outbox_table",
+        lambda _connection: (_ for _ in ()).throw(sqlite3.OperationalError("v4 outbox migration failed")),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="v4 outbox migration failed"):
+        SQLiteVacancyRepository(db_path).open()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'vacancy_publications'").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_v3_migration_baseline_matches_equivalent_runtime_publication_day(tmp_path):
+    db_path = tmp_path / "v3-equivalent-publication.db"
+    create_v3_database(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("UPDATE vacancies SET published_at = ? WHERE id = 1", ("2026-11-15T10:00:00+02:00",))
+        connection.commit()
+    finally:
+        connection.close()
+
+    repo = SQLiteVacancyRepository(db_path)
+    repo.open()
+    result = repo.persist_observation(
+        replace(
+            vacancy(),
+            published_at=datetime(2026, 11, 15, 8, 0, tzinfo=timezone.utc),
+            scraped_at=LATER,
+        ),
+        observation_complete=True,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+
+    assert [publication.published_at for publication in repo.list_publications(1)] == ["2026-11-15"]
+    assert result.status is PersistenceStatus.UNCHANGED
+    assert result.notification_enqueued is False
+    assert repo.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
+    repo.close()
+
+
 def test_inserted_creates_one_atomic_outbox_event_with_route_and_profile(repository):
     result = persist_new(repository, route="alternate", profile_slug="support")
     event = repository.get_notification_event(result.notification_event_id)
@@ -219,6 +353,8 @@ def test_inserted_creates_one_atomic_outbox_event_with_route_and_profile(reposit
     assert result.status is PersistenceStatus.INSERTED
     assert result.notification_enqueued is True
     assert event.event_type == "VACANCY_INSERTED"
+    assert event.publication_id is None
+    assert event.event_key == f"vacancy:{result.vacancy_id}:inserted"
     assert event.route == "alternate"
     assert event.profile_slug == "support"
     assert event.attempt_count == 0
@@ -246,6 +382,82 @@ def test_existing_updates_unchanged_and_discovery_only_never_create_a_second_eve
     assert discovery_only.status is PersistenceStatus.UNCHANGED
     assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
     assert repository.get_notification_event(first.notification_event_id).route == "main"
+
+
+def test_republished_creates_one_distinct_event_with_publication_identity(repository):
+    first = persist_new(repository)
+    repost = repository.persist_observation(
+        replace(vacancy(), published_at=date(2026, 8, 15), scraped_at=LATER),
+        observation_complete=True,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="alternate", profile_slug="support"),
+    )
+    event = repository.get_notification_event(repost.notification_event_id)
+
+    assert repost.status is PersistenceStatus.REPUBLISHED
+    assert repost.vacancy_id == first.vacancy_id
+    assert repost.notification_enqueued is True
+    assert event.event_type == "VACANCY_REPUBLISHED"
+    assert event.publication_id == repost.publication_id
+    assert event.event_key == f"publication:{repost.publication_id}:republished"
+    assert event.route == "alternate"
+    assert event.profile_slug == "support"
+
+
+def test_same_repost_from_another_profile_creates_no_second_publication_or_event(repository):
+    first = persist_new(repository)
+    repost = replace(vacancy(), published_at=date(2026, 8, 15), scraped_at=LATER)
+    first_repost = repository.persist_observation(
+        repost,
+        observation_complete=True,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    second_repost = repository.persist_observation(
+        replace(repost, discovery_profiles=("data_engineer",)),
+        observation_complete=True,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="data_engineer"),
+    )
+
+    assert first_repost.status is PersistenceStatus.REPUBLISHED
+    assert second_repost.status is PersistenceStatus.UNCHANGED
+    assert second_repost.notification_enqueued is False
+    assert len(repository.list_publications(first.vacancy_id)) == 2
+    assert repository.get_discovery_profiles(first.vacancy_id) == ("data_engineer", "python")
+    assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 2
+
+
+def test_multiple_reposts_create_one_logical_vacancy_and_three_distinct_events(repository):
+    first = persist_new(repository)
+    repost_one = repository.persist_observation(
+        replace(vacancy(), published_at=date(2026, 8, 15), scraped_at=LATER),
+        observation_complete=True,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    repost_two = repository.persist_observation(
+        replace(vacancy(), published_at=date(2026, 9, 1), scraped_at=LATER + timedelta(minutes=1)),
+        observation_complete=True,
+        observed_at=LATER + timedelta(minutes=1),
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    events = tuple(
+        tuple(row)
+        for row in repository.connection.execute(
+            "SELECT event_type, event_key FROM notification_outbox ORDER BY id"
+        )
+    )
+
+    assert repost_one.status is PersistenceStatus.REPUBLISHED
+    assert repost_two.status is PersistenceStatus.REPUBLISHED
+    assert repository.connection.execute("SELECT COUNT(*) FROM vacancies").fetchone()[0] == 1
+    assert len(repository.list_publications(first.vacancy_id)) == 3
+    assert events == (
+        ("VACANCY_INSERTED", "vacancy:1:inserted"),
+        ("VACANCY_REPUBLISHED", f"publication:{repost_one.publication_id}:republished"),
+        ("VACANCY_REPUBLISHED", f"publication:{repost_two.publication_id}:republished"),
+    )
 
 
 def test_outbox_failure_rolls_back_vacancy_and_discovery_insert(repository, monkeypatch):
@@ -285,6 +497,46 @@ def test_dispatch_success_marks_delivered_and_keeps_audit_row(repository, resolv
     assert event.last_error is None
     assert event.next_attempt_at is None
     assert dispatcher.dispatch_due() == (0, 0)
+
+
+def test_incomplete_repost_uses_publication_event_date_without_degrading_snapshot(repository, resolver):
+    complete = vacancy(published_at=date(2026, 11, 1))
+    inserted = repository.persist_observation(
+        complete,
+        observation_complete=True,
+        observed_at=NOW,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    listing_only_repost = replace(
+        complete,
+        title="Listing-only title",
+        description="Listing-only description",
+        published_at=date(2026, 11, 15),
+        scraped_at=LATER,
+    )
+    repost = repository.persist_observation(
+        listing_only_repost,
+        observation_complete=False,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    client = RecordingTelegramClient()
+    dispatcher = NotificationDispatcher(
+        repository,
+        route_resolver=resolver,
+        telegram_client=client,
+        retry_delay_seconds=900,
+        batch_limit=10,
+        now=lambda: LATER,
+    )
+
+    assert repost.status is PersistenceStatus.REPUBLISHED
+    assert repost.notification_enqueued is True
+    assert repository.get_vacancy_by_id(inserted.vacancy_id) == complete
+    assert dispatcher.dispatch_due() == (2, 0)
+    assert "🔄 *Повторно опублікована вакансія*" in client.calls[1][1]
+    assert "*Опубліковано:* 2026\\-11\\-15" in client.calls[1][1]
+    assert "2026\\-11\\-01" not in client.calls[1][1]
 
 
 def test_dispatch_failure_is_pending_sanitized_and_not_retried_until_due(repository, resolver):
@@ -446,15 +698,26 @@ def test_notification_outbox_foreign_key_integrity_and_cascade(repository):
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             """
-            INSERT INTO notification_outbox (vacancy_id, event_type, route, created_at)
-            VALUES (999, 'VACANCY_INSERTED', 'main', ?)
+            INSERT INTO notification_outbox (vacancy_id, event_type, event_key, route, created_at)
+            VALUES (999, 'VACANCY_INSERTED', 'vacancy:999:inserted', 'main', ?)
             """,
             (NOW.isoformat(),),
+        )
+    connection.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO notification_outbox (
+                vacancy_id, publication_id, event_type, event_key, route, created_at
+            ) VALUES (?, 999, 'VACANCY_REPUBLISHED', 'publication:999:republished', 'main', ?)
+            """,
+            (result.vacancy_id, NOW.isoformat()),
         )
     connection.rollback()
     connection.execute("DELETE FROM vacancies WHERE id = ?", (result.vacancy_id,))
     connection.commit()
 
+    assert connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
 
 
@@ -486,6 +749,26 @@ def test_canonical_formatter_handles_full_minimal_optional_and_special_character
     assert "Views" not in message
     assert "Responses" not in message
     assert "truncate_description" not in message
+
+
+def test_republished_formatter_adds_compact_event_context_without_changing_inserted_format():
+    old_publication = vacancy(published_at=date(2026, 8, 12))
+    inserted = format_vacancy_notification(
+        old_publication,
+        event_type="VACANCY_INSERTED",
+        publication_published_at="2026-08-15",
+    )
+    republished = format_vacancy_notification(
+        old_publication,
+        event_type="VACANCY_REPUBLISHED",
+        publication_published_at="2026-08-15",
+    )
+
+    assert "Повторно опублікована вакансія" not in inserted
+    assert "🔄 *Повторно опублікована вакансія*" in republished
+    assert "*DJINNI\\.CO*" in republished
+    assert "2026\\-08\\-12" in inserted
+    assert "2026\\-08\\-15" in republished
 
 
 @pytest.mark.parametrize(

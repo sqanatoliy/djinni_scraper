@@ -52,8 +52,23 @@ class NotificationDispatcher:
                 vacancy = self.repository.get_vacancy_by_id(event.vacancy_id)
                 if vacancy is None:
                     raise RuntimeError("Canonical vacancy for notification event is unavailable")
+                publication_published_at = None
+                if event.event_type == "VACANCY_REPUBLISHED":
+                    if event.publication_id is None:
+                        raise RuntimeError("Republished notification event has no publication identity")
+                    publication = self.repository.get_publication(event.publication_id)
+                    if publication is None or publication.vacancy_id != event.vacancy_id:
+                        raise RuntimeError("Publication for republished notification event is unavailable")
+                    publication_published_at = publication.published_at
                 destination = self.route_resolver.resolve(event.route)
-                self.telegram_client.send(destination, format_vacancy_notification(vacancy))
+                self.telegram_client.send(
+                    destination,
+                    format_vacancy_notification(
+                        vacancy,
+                        event_type=event.event_type,
+                        publication_published_at=publication_published_at,
+                    ),
+                )
                 self.repository.mark_notification_delivered(event.id, attempted_at=now)
                 self.logger.info("notification-delivered event_id=%s route=%s", event.id, event.route)
                 delivered += 1

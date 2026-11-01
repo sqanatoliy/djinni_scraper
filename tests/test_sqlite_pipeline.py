@@ -1,7 +1,7 @@
 import logging
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -115,6 +115,27 @@ def test_updated_unchanged_and_discovery_only_observations_do_not_enqueue_or_sen
     assert len(telegram_client.calls) == 1
     assert pipeline.repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
     assert pipeline.repository.get_discovery_profiles(1) == ("data_engineer", "python")
+
+
+def test_pipeline_enqueues_and_formats_a_republished_publication(opened_pipeline):
+    pipeline, spider, telegram_client = opened_pipeline
+    original = canonical_vacancy(published_at=date(2026, 8, 12))
+    repost = replace(original, published_at=date(2026, 8, 15), title="Republished canonical title")
+
+    pipeline.process_item(parser_item(original), spider)
+    pipeline.process_item(parser_item(repost), spider)
+    pipeline.dispatcher.dispatch_due()
+
+    events = tuple(
+        tuple(row)
+        for row in pipeline.repository.connection.execute(
+            "SELECT event_type, event_key FROM notification_outbox ORDER BY id"
+        )
+    )
+    assert events[0] == ("VACANCY_INSERTED", "vacancy:1:inserted")
+    assert events[1][0] == "VACANCY_REPUBLISHED"
+    assert len(telegram_client.calls) == 2
+    assert "Повторно опублікована вакансія" in telegram_client.calls[1][1]
 
 
 def test_telegram_failure_keeps_event_pending_without_rolling_back_vacancy(opened_pipeline):

@@ -10,6 +10,7 @@ from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequire
 from djinni_scraper.persistence import sqlite as sqlite_module
 from djinni_scraper.persistence.sqlite import (
     IdentityConflictError,
+    NotificationIntent,
     PersistenceStatus,
     SCHEMA_VERSION,
     SQLiteVacancyRepository,
@@ -80,11 +81,13 @@ def persist(
     *,
     observed_at: datetime = OBSERVED_AT,
     complete: bool = True,
+    notification_intent: NotificationIntent | None = None,
 ):
     return repository.persist_observation(
         vacancy,
         observation_complete=complete,
         observed_at=observed_at,
+        notification_intent=notification_intent,
     )
 
 
@@ -175,23 +178,25 @@ def create_v1_database(path: Path, vacancy: Vacancy, profiles: tuple[str, ...]) 
         connection.close()
 
 
-def test_initialization_creates_schema_v3_with_normalized_discoveries_outbox_and_foreign_keys(repository):
+def test_initialization_creates_schema_v4_with_publications_discoveries_outbox_and_foreign_keys(repository):
     connection = repository.connection
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     vacancy_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancies)")}
     discovery_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancy_discoveries)")}
+    publication_columns = {row[1] for row in connection.execute("PRAGMA table_info(vacancy_publications)")}
     outbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(notification_outbox)")}
     vacancy_indexes = {row[1] for row in connection.execute("PRAGMA index_list(vacancies)")}
     discovery_foreign_keys = list(connection.execute("PRAGMA foreign_key_list(vacancy_discoveries)"))
 
-    assert {"vacancies", "vacancy_discoveries", "notification_outbox"}.issubset(tables)
+    assert {"vacancies", "vacancy_publications", "vacancy_discoveries", "notification_outbox"}.issubset(tables)
     assert {"content_hash", "first_seen_at", "last_seen_at"}.issubset(vacancy_columns)
     assert "discovery_profiles_json" not in vacancy_columns
     assert _source_transport_only_columns().isdisjoint(vacancy_columns)
     assert {"vacancy_id", "profile_slug", "first_discovered_at", "last_discovered_at"} == discovery_columns
-    assert {"vacancy_id", "event_type", "route", "attempt_count", "next_attempt_at", "delivered_at"}.issubset(outbox_columns)
+    assert {"id", "vacancy_id", "published_at", "first_observed_at", "last_observed_at"} == publication_columns
+    assert {"vacancy_id", "publication_id", "event_type", "event_key", "route", "attempt_count", "next_attempt_at", "delivered_at"}.issubset(outbox_columns)
     assert {"idx_vacancies_source", "idx_vacancies_source_vacancy_id", "idx_vacancies_published_at", "idx_vacancies_last_seen_at"}.issubset(vacancy_indexes)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
     assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert discovery_foreign_keys[0][2:] == ("vacancies", "vacancy_id", "id", "NO ACTION", "CASCADE", "NONE")
 
@@ -206,19 +211,20 @@ def test_v1_database_migrates_preserving_rows_backfills_discovery_hash_and_times
     row = _vacancy_row(repository, 1)
     restored = repository.get_vacancy_by_identity_key(vacancy_identity_key(legacy))
 
-    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 4
     assert _vacancy_count(repository) == 1
     assert restored == replace(legacy, discovery_profiles=("data_engineer", "python"))
     assert row["content_hash"] == vacancy_content_hash(legacy)
     assert row["first_seen_at"] == OBSERVED_AT.isoformat()
     assert row["last_seen_at"] == OBSERVED_AT.isoformat()
     assert repository.get_discovery_profiles(1) == ("data_engineer", "python")
+    assert [publication.published_at for publication in repository.list_publications(1)] == ["2026-08-12"]
     assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
     assert "discovery_profiles_json" not in {entry[1] for entry in repository.connection.execute("PRAGMA table_info(vacancies)")}
 
     repository.close()
     repository.open()
-    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 4
     assert _vacancy_count(repository) == 1
     repository.close()
 
@@ -247,11 +253,11 @@ def test_failed_v1_migration_rolls_back_table_and_user_version(tmp_path, monkeyp
 def test_unsupported_future_schema_is_rejected(tmp_path):
     db_path = tmp_path / "future.db"
     connection = sqlite3.connect(db_path)
-    connection.execute("PRAGMA user_version = 4")
+    connection.execute("PRAGMA user_version = 5")
     connection.commit()
     connection.close()
 
-    with pytest.raises(RuntimeError, match="Unsupported SQLite schema version 4"):
+    with pytest.raises(RuntimeError, match="Unsupported SQLite schema version 5"):
         SQLiteVacancyRepository(db_path).open()
 
 
@@ -354,9 +360,254 @@ def test_title_and_published_date_are_not_identity_even_when_content_updates(rep
 
     result = persist(repository, changed, observed_at=LATER)
 
-    assert result.status is PersistenceStatus.UPDATED
+    assert result.status is PersistenceStatus.REPUBLISHED
     assert result.vacancy_id == first.vacancy_id
     assert _vacancy_count(repository) == 1
+
+
+def test_initial_publication_is_created_only_for_non_null_published_at(repository):
+    with_date = persist(repository, full_vacancy())
+    without_date = persist(
+        repository,
+        minimal_vacancy(source_vacancy_id="without-date", published_at=None),
+        observed_at=LATER,
+    )
+
+    assert [publication.published_at for publication in repository.list_publications(with_date.vacancy_id)] == [
+        "2026-08-12"
+    ]
+    assert repository.list_publications(without_date.vacancy_id) == ()
+
+
+def test_same_publication_date_is_unchanged_but_content_change_is_updated(repository):
+    original = full_vacancy()
+    first = persist(repository, original)
+    same_date = persist(repository, replace(original, scraped_at=LATER), observed_at=LATER)
+    changed = persist(
+        repository,
+        replace(original, title="Changed title", scraped_at=LATEST),
+        observed_at=LATEST,
+    )
+
+    assert same_date.status is PersistenceStatus.UNCHANGED
+    assert changed.status is PersistenceStatus.UPDATED
+    assert len(repository.list_publications(first.vacancy_id)) == 1
+
+
+def test_newer_publication_returns_republished_keeps_identity_and_refreshes_complete_snapshot(repository):
+    original = full_vacancy()
+    first = persist(repository, original)
+    repost = replace(
+        original,
+        published_at=date(2026, 8, 15),
+        title="Republished title",
+        scraped_at=LATER,
+    )
+
+    result = persist(repository, repost, observed_at=LATER)
+
+    assert result.status is PersistenceStatus.REPUBLISHED
+    assert result.vacancy_id == first.vacancy_id
+    assert result.publication_added is True
+    assert repository.get_vacancy(repost) == repost
+    assert [publication.published_at for publication in repository.list_publications(first.vacancy_id)] == [
+        "2026-08-12",
+        "2026-08-15",
+    ]
+
+
+def test_publication_date_alone_does_not_create_content_update_but_is_republished(repository):
+    original = full_vacancy()
+    first = persist(repository, original)
+    repost = replace(original, published_at=date(2026, 8, 15), scraped_at=LATER)
+
+    result = persist(repository, repost, observed_at=LATER)
+
+    assert vacancy_content_hash(original) == vacancy_content_hash(repost)
+    assert result.status is PersistenceStatus.REPUBLISHED
+    assert result.vacancy_id == first.vacancy_id
+
+
+@pytest.mark.parametrize(
+    "published_at",
+    (
+        date(2026, 8, 12),
+        datetime(2026, 8, 12, 14, 1, 42, 527603),
+        datetime(2026, 8, 12, 14, 1, 42, 527603, tzinfo=timezone.utc),
+    ),
+)
+def test_publication_day_normalization_preserves_canonical_source_precision(repository, published_at):
+    source = full_vacancy(published_at=published_at)
+    result = persist(repository, source)
+    publication = repository.list_publications(result.vacancy_id)[0]
+
+    assert publication.published_at == "2026-08-12"
+    assert repository.get_vacancy(source).published_at == published_at
+
+
+def test_same_day_timestamp_change_is_not_republished(repository):
+    original = full_vacancy(published_at=datetime(2026, 8, 12, 9, 0, 0, 100))
+    first = persist(
+        repository,
+        original,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+    same_publication = replace(
+        original,
+        published_at=datetime(2026, 8, 12, 14, 1, 42, 527603),
+        scraped_at=LATER,
+    )
+
+    result = persist(
+        repository,
+        same_publication,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+
+    assert result.status is PersistenceStatus.UNCHANGED
+    assert result.vacancy_id == first.vacancy_id
+    assert result.publication_added is False
+    assert result.notification_enqueued is False
+    assert [publication.published_at for publication in repository.list_publications(first.vacancy_id)] == [
+        "2026-08-12",
+    ]
+    assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
+
+
+def test_date_and_midnight_datetime_representations_share_one_publication_day(repository):
+    original = full_vacancy(published_at=date(2026, 8, 12))
+    first = persist(repository, original)
+    midnight_naive = persist(
+        repository,
+        replace(original, published_at=datetime(2026, 8, 12), scraped_at=LATER),
+        observed_at=LATER,
+    )
+    midnight_utc = persist(
+        repository,
+        replace(
+            original,
+            published_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+            scraped_at=LATEST,
+        ),
+        observed_at=LATEST,
+    )
+
+    assert midnight_naive.status is PersistenceStatus.UNCHANGED
+    assert midnight_utc.status is PersistenceStatus.UNCHANGED
+    assert len(repository.list_publications(first.vacancy_id)) == 1
+
+
+def test_equivalent_timezone_instants_share_one_publication_day(repository):
+    original = full_vacancy(
+        published_at=datetime(2026, 8, 12, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+    )
+    first = persist(repository, original)
+    same_instant = replace(
+        original,
+        published_at=datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc),
+        scraped_at=LATER,
+    )
+
+    result = persist(repository, same_instant, observed_at=LATER)
+
+    assert result.status is PersistenceStatus.UNCHANGED
+    assert len(repository.list_publications(first.vacancy_id)) == 1
+
+
+def test_next_publication_day_is_republished_with_a_new_event(repository):
+    original = full_vacancy(published_at=datetime(2026, 8, 12, 14, 0))
+    first = persist(repository, original)
+    repost = replace(original, published_at=datetime(2026, 8, 13, 9, 0), scraped_at=LATER)
+
+    result = persist(
+        repository,
+        repost,
+        observed_at=LATER,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+
+    assert result.status is PersistenceStatus.REPUBLISHED
+    assert result.notification_enqueued is True
+    assert [publication.published_at for publication in repository.list_publications(first.vacancy_id)] == [
+        "2026-08-12",
+        "2026-08-13",
+    ]
+
+
+def test_first_known_publication_for_existing_historyless_vacancy_is_baseline_not_repost(repository):
+    original = full_vacancy(published_at=None)
+    first = persist(repository, original)
+    date_now_known = replace(original, published_at=date(2026, 8, 12), scraped_at=LATER)
+
+    result = persist(repository, date_now_known, observed_at=LATER)
+
+    assert result.status is PersistenceStatus.UPDATED
+    assert result.vacancy_id == first.vacancy_id
+    assert result.publication_added is True
+    assert [publication.published_at for publication in repository.list_publications(first.vacancy_id)] == [
+        "2026-08-12"
+    ]
+
+
+def test_older_unseen_publication_is_recorded_without_republish_or_snapshot_regression(repository):
+    current = full_vacancy(published_at=date(2026, 8, 15), title="Current title")
+    first = persist(repository, current)
+    older = replace(
+        current,
+        published_at=date(2026, 8, 12),
+        title="Historical title",
+        scraped_at=LATER,
+    )
+
+    result = persist(repository, older, observed_at=LATER)
+
+    assert result.status is PersistenceStatus.UNCHANGED
+    assert result.publication_added is True
+    assert repository.get_vacancy(current).title == "Current title"
+    assert [publication.published_at for publication in repository.list_publications(first.vacancy_id)] == [
+        "2026-08-12",
+        "2026-08-15",
+    ]
+
+
+def test_none_published_at_does_not_change_publication_history(repository):
+    first = persist(repository, full_vacancy())
+    result = persist(
+        repository,
+        replace(full_vacancy(), published_at=None, scraped_at=LATER),
+        observed_at=LATER,
+        complete=False,
+    )
+
+    assert result.status is PersistenceStatus.UNCHANGED
+    assert result.publication_added is False
+    assert len(repository.list_publications(first.vacancy_id)) == 1
+
+
+def test_incomplete_republication_records_history_without_erasing_complete_snapshot(repository):
+    complete = full_vacancy()
+    first = persist(repository, complete)
+    listing_only_repost = replace(
+        complete,
+        published_at=date(2026, 8, 15),
+        title="Listing-only title",
+        description="Listing-only description",
+        scraped_at=LATER,
+    )
+
+    result = persist(
+        repository,
+        listing_only_repost,
+        observed_at=LATER,
+        complete=False,
+        notification_intent=NotificationIntent(route="main", profile_slug="python"),
+    )
+
+    assert result.status is PersistenceStatus.REPUBLISHED
+    assert result.notification_enqueued is True
+    assert repository.get_vacancy(complete).title == complete.title
+    assert len(repository.list_publications(first.vacancy_id)) == 2
 
 
 @pytest.mark.parametrize(
@@ -421,6 +672,7 @@ def test_content_hash_is_deterministic_and_excludes_identity_and_discovery(repos
         original,
         source_vacancy_id="different-id",
         discovery_profiles=("data_engineer",),
+        published_at=date(2026, 8, 14),
         scraped_at=LATER,
     )
 
