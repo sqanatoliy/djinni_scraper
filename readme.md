@@ -51,6 +51,10 @@ Djinni HTML / JSON-LD
 
 `DjinniScraperItem` зберігає тільки Djinni-specific transport data. `Vacancy` — незалежна від Scrapy, SQLite та Telegram domain model.
 
+## Відновлення Djinni сесії
+
+За відсутнього або stale `state.json` scraper залишає початкову Playwright-вкладку без login-взаємодії, через 2 секунди створює в тому самому context нову вкладку, ще через 2 секунди відкриває у ній головну Djinni. Потім він автоматично натискає локалізований `Увійти` / `Log In`, заповнює форму, чекає 2 секунди перед submit, перевіряє authenticated navigation marker і лише після цього зберігає новий storage state. Після завершення auth-flow обидві callback-owned сторінки закриваються, але context і Chromium лишаються під керуванням scrapy-playwright. Прямий перехід на `/login` не використовується як login entry point.
+
 ## SQLite і сповіщення
 
 - Runtime DB: `runtime/vacancies.db` (schema version 3).

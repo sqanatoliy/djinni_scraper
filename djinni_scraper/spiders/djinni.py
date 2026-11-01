@@ -1,5 +1,7 @@
+import asyncio
 import os
-from urllib.parse import urljoin as urllib_urljoin, urlparse
+import re
+from urllib.parse import urljoin as urllib_urljoin, urlsplit, urlunsplit
 
 import scrapy
 from decouple import config
@@ -16,17 +18,30 @@ from djinni_scraper.utils.url_utils import BASE_URL, get_start_url
 from ..items import DjinniScraperItem
 
 STATE_FILE = "state.json"
-LOGIN_URL = urllib_urljoin(BASE_URL, "/login?lang=uk&from=jobs&next=/jobs/")
+DJINNI_HOME_URL = "https://djinni.co/"
 LOGIN_TIMEOUT_MS = 10_000
+# Djinni authentication currently requires a fresh tab and short delays between
+# browser actions; keep this sequence regression-tested.
+DJINNI_AUTH_STEP_DELAY_MS = 2_000
 AD_HOC_DISCOVERY_ARGUMENT = "category"
+LOGIN_ACTION_NAME = re.compile(r"^(?:Увійти|Log In|Login)$", re.IGNORECASE)
+
+
+class LoginUIError(RuntimeError):
+    """The expected interactive Djinni login UI was unavailable or unsafe to use."""
 
 
 class DjinniSelectors:
-    LOGIN_FORM_SELECTOR = "form#signup"
-    EMAIL_SELECTOR = "#email"
-    PASSWORD_SELECTOR = "#password"
-    LOGIN_BUTTON_SELECTOR = 'form#signup button[type="submit"]:not([name])'
-    AUTHENTICATED_MARKER_SELECTOR = 'a[href^="/logout"]'
+    LOGIN_FORM_SELECTOR = 'form:has(input[name="email"]), form:has(input[type="email"])'
+    EMAIL_SELECTOR = 'input[name="email"], input[type="email"]'
+    PASSWORD_SELECTOR = 'input[name="password"], input[type="password"]'
+    LOGIN_BUTTON_SELECTOR = 'button[type="submit"], input[type="submit"]'
+    AUTHENTICATED_MARKER_SELECTOR = 'a[href^="/logout"], a[href^="/my/inbox"]'
+    LOGIN_ERROR_SELECTOR = '[role="alert"], .invalid-feedback, .alert-danger'
+    LOGIN_CHALLENGE_SELECTOR = (
+        'iframe[src*="captcha"], iframe[title*="challenge" i], '
+        '[class*="captcha" i], [id*="captcha" i], [data-sitekey]'
+    )
     JOBS_LIST_SELECTOR = ".list-jobs .job-item"
     JOB_LINK_SELECTOR = ".job_item__header-link"
     JOB_TITLE_SELECTOR = ".job_item__header-link .job-item__position"
@@ -90,44 +105,120 @@ class DjinniSpider(scrapy.Spider):
             yield self._login_request(self.start_urls[0], auth_recovery_attempted=False)
 
     async def login(self, response):
-        """Logs in and resumes the one jobs URL that initiated this auth flow."""
-        page = response.meta.get("playwright_page")
+        """Authenticates in a fresh tab, then resumes the original jobs URL."""
+        initial_page = response.meta.get("playwright_page")
+        auth_page = None
         target_url = response.meta.get("auth_target_url", self.start_urls[0])
+        email = ""
+        password = ""
+        step = "initial browser page"
         try:
-            if not page:
-                raise CloseSpider("Djinni login did not receive a Playwright page")
+            if not initial_page:
+                raise LoginUIError("Djinni auth did not receive the initial Playwright page")
 
             email, password = self._get_credentials()
-            await page.wait_for_selector(DjinniSelectors.LOGIN_FORM_SELECTOR, timeout=LOGIN_TIMEOUT_MS)
-            await page.fill(DjinniSelectors.EMAIL_SELECTOR, email)
-            await page.fill(DjinniSelectors.PASSWORD_SELECTOR, password)
-            await page.click(DjinniSelectors.LOGIN_BUTTON_SELECTOR)
+            self.logger.info("Djinni auth: initial browser page ready.")
 
-            if not await self._wait_for_authenticated(page):
+            step = "initial-page delay"
+            self.logger.info("Djinni auth: waiting 2 seconds before creating auth tab.")
+            await initial_page.wait_for_timeout(DJINNI_AUTH_STEP_DELAY_MS)
+
+            step = "auth-tab creation"
+            auth_page = await initial_page.context.new_page()
+            self.logger.info("Djinni auth: new auth tab created.")
+
+            step = "auth-tab delay"
+            self.logger.info("Djinni auth: waiting 2 seconds before Djinni navigation.")
+            await auth_page.wait_for_timeout(DJINNI_AUTH_STEP_DELAY_MS)
+
+            step = "homepage navigation"
+            await auth_page.goto(DJINNI_HOME_URL, wait_until="domcontentloaded")
+            await auth_page.wait_for_load_state("domcontentloaded", timeout=LOGIN_TIMEOUT_MS)
+            self.logger.info("Djinni auth: homepage opened.")
+
+            step = "homepage login action"
+            login_action = await self._login_action(auth_page)
+            await self._click(login_action, "homepage login action")
+            self.logger.info("Djinni auth: login entry clicked.")
+
+            step = "login form readiness"
+            login_form = await self._wait_for_login_form(auth_page)
+            self.logger.info("Djinni auth: login form ready.")
+            step = "email input"
+            email_input = await self._required_form_control(
+                login_form, DjinniSelectors.EMAIL_SELECTOR, "email input"
+            )
+            step = "password input"
+            password_input = await self._required_form_control(
+                login_form, DjinniSelectors.PASSWORD_SELECTOR, "password input"
+            )
+            step = "email fill"
+            await self._fill_and_verify(email_input, email, "email")
+            step = "password fill"
+            await self._fill_and_verify(password_input, password, "password")
+            self.logger.info("Djinni auth: credentials filled.")
+
+            step = "post-credentials delay"
+            self.logger.info("Djinni auth: waiting 2 seconds before submit.")
+            await auth_page.wait_for_timeout(DJINNI_AUTH_STEP_DELAY_MS)
+
+            step = "login submit"
+            submit = await self._login_submit(login_form)
+            step = "login submit click"
+            await self._click(submit, "login submit")
+            self.logger.info("Djinni auth: login submit clicked.")
+
+            step = "authenticated-state wait"
+            if not await self._wait_for_authenticated(auth_page):
+                self.logger.warning(
+                    "Djinni login did not reach an authenticated state: %s",
+                    await self._login_diagnostic(auth_page, email, password),
+                )
                 self._discard_storage_state()
                 raise CloseSpider("Djinni login was rejected or remained anonymous")
 
             try:
-                await page.context.storage_state(path=STATE_FILE)
+                step = "storage state write"
+                await auth_page.context.storage_state(path=STATE_FILE)
             except PlaywrightError:
                 self.logger.exception("Failed to save confirmed Djinni Playwright storage state.")
                 raise
 
-            self.logger.info("✅ Djinni login succeeded; local storage state saved.")
+            self.logger.info("Djinni auth: authentication confirmed; local storage state saved.")
+            await self._close_initial_page(initial_page)
+            initial_page = None
             yield self._jobs_request(
                 target_url,
                 auth_recovery_attempted=response.meta.get("auth_recovery_attempted", False),
             )
+        except LoginUIError as error:
+            self._discard_storage_state()
+            self.logger.error(
+                "Djinni login UI failed: %s; %s",
+                error,
+                await self._login_diagnostic(auth_page or initial_page, email, password),
+            )
+            raise CloseSpider("Djinni login UI was unavailable") from error
         except PlaywrightTimeoutError as error:
             self._discard_storage_state()
-            self.logger.error("Djinni login form or authenticated marker was not available before timeout.")
+            self.logger.error(
+                "Djinni login timed out: %s",
+                await self._login_diagnostic(auth_page or initial_page, email, password),
+            )
             raise CloseSpider("Djinni login timed out or remained anonymous") from error
         except PlaywrightError as error:
             self._discard_storage_state()
-            self.logger.error("Djinni Playwright error during login: %s", error)
+            self.logger.error(
+                "Djinni Playwright error during %s (%s): error=%s %s",
+                step,
+                type(error).__name__,
+                self._safe_text(str(error), email, password),
+                await self._login_diagnostic(auth_page or initial_page, email, password),
+            )
             raise CloseSpider("Djinni login failed due to a Playwright error") from error
         finally:
-            await self._close_page(page)
+            await self._close_auth_page(auth_page)
+            await self._close_initial_page(initial_page)
 
     async def parse_jobs(self, response):
         """Парсимо вакансії після авторизації."""
@@ -169,9 +260,10 @@ class DjinniSpider(scrapy.Spider):
         )
 
     def _login_request(self, target_url, auth_recovery_attempted):
+        """Obtains an initial managed page; login itself happens only in a fresh tab."""
         self._get_credentials()
         return scrapy.Request(
-            url=LOGIN_URL,
+            url=target_url,
             callback=self.login,
             meta={
                 "playwright": True,
@@ -238,26 +330,156 @@ class DjinniSpider(scrapy.Spider):
         )
 
     async def _wait_for_authenticated(self, page):
-        try:
-            await page.wait_for_selector(
-                DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR,
-                timeout=LOGIN_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError:
-            return False
-        return await self._is_authenticated(page)
+        """Waits for a positive logged-in-only marker or a visible login error, bounded in time."""
+        authenticated_marker = page.locator(DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR).first
+        login_error = page.locator(DjinniSelectors.LOGIN_ERROR_SELECTOR).first
+        marker_wait = asyncio.create_task(
+            authenticated_marker.wait_for(state="visible", timeout=LOGIN_TIMEOUT_MS)
+        )
+        error_wait = asyncio.create_task(login_error.wait_for(state="visible", timeout=LOGIN_TIMEOUT_MS))
+        done, pending = await asyncio.wait(
+            {marker_wait, error_wait}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        marker_result, _error_result = await asyncio.gather(
+            marker_wait, error_wait, return_exceptions=True
+        )
+
+        if marker_wait in done and not isinstance(marker_result, BaseException):
+            return await self._is_authenticated(page)
+        return False
 
     @staticmethod
     async def _is_authenticated(page):
-        current_path = urlparse(page.url).path.rstrip("/")
-        if current_path == "/login":
+        """Requires a positive logged-in-only navigation marker, never just a changed URL."""
+        marker = page.locator(DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR)
+        return await marker.count() > 0 and await marker.first.is_visible()
+
+    async def _login_action(self, page):
+        for role in ("link", "button"):
+            action = page.get_by_role(role, name=LOGIN_ACTION_NAME)
+            count = await action.count()
+            if count > 1:
+                raise LoginUIError(f"Djinni homepage {role} login action is ambiguous ({count} matches)")
+            if count == 1 and await action.is_visible():
+                return action
+        raise LoginUIError("Djinni homepage has no visible localized login action")
+
+    async def _wait_for_login_form(self, page):
+        login_form = page.locator(DjinniSelectors.LOGIN_FORM_SELECTOR)
+        try:
+            await login_form.wait_for(state="visible", timeout=LOGIN_TIMEOUT_MS)
+        except PlaywrightTimeoutError as error:
+            raise LoginUIError("Djinni login form did not become visible after the homepage action") from error
+        return await self._required_visible(login_form, "login form")
+
+    async def _required_form_control(self, login_form, selector, label, *, enabled=False):
+        control = login_form.locator(selector)
+        control = await self._required_visible(control, label)
+        if enabled and not await self._is_action_enabled(control, label):
+            raise LoginUIError(f"Djinni {label} is disabled")
+        return control
+
+    async def _login_submit(self, login_form):
+        submit = login_form.get_by_role("button", name=LOGIN_ACTION_NAME)
+        count = await submit.count()
+        if count > 1:
+            raise LoginUIError(f"Djinni login submit is ambiguous ({count} matches)")
+        if count == 1:
+            submit = await self._required_visible(submit, "login submit")
+            if not await self._is_action_enabled(submit, "login submit"):
+                raise LoginUIError("Djinni login submit is disabled")
+            return submit
+        return await self._required_form_control(
+            login_form, DjinniSelectors.LOGIN_BUTTON_SELECTOR, "login submit", enabled=True
+        )
+
+    @staticmethod
+    async def _required_visible(locator, label):
+        count = await locator.count()
+        if count != 1:
+            raise LoginUIError(f"Djinni {label} expected exactly one match; found {count}")
+        if not await locator.is_visible():
+            raise LoginUIError(f"Djinni {label} is not visible")
+        return locator
+
+    @staticmethod
+    async def _is_action_enabled(locator, label):
+        try:
+            return await locator.is_enabled()
+        except PlaywrightError:
+            try:
+                disabled = await locator.get_attribute("disabled")
+                aria_disabled = await locator.get_attribute("aria-disabled")
+            except PlaywrightError as error:
+                raise LoginUIError(f"Djinni {label} enabled state could not be determined") from error
+            return disabled is None and aria_disabled != "true"
+
+    async def _fill_and_verify(self, locator, value, field_name):
+        try:
+            await locator.fill(value)
+            filled = bool(await locator.input_value())
+        except PlaywrightError as error:
+            raise LoginUIError(f"Djinni {field_name} input could not be filled") from error
+        if not filled:
+            raise LoginUIError(f"Djinni {field_name} input did not retain a value")
+        self.logger.info("Djinni login %s filled: yes", field_name)
+
+    @staticmethod
+    async def _click(locator, label):
+        try:
+            await locator.click()
+        except PlaywrightError as error:
+            raise LoginUIError(f"Djinni {label} could not be clicked") from error
+
+    async def _login_diagnostic(self, page, email, password):
+        if not page:
+            return "page=missing"
+        login_form = page.locator(DjinniSelectors.LOGIN_FORM_SELECTOR)
+        email_input = login_form.locator(DjinniSelectors.EMAIL_SELECTOR)
+        password_input = login_form.locator(DjinniSelectors.PASSWORD_SELECTOR)
+        authenticated_marker = page.locator(DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR)
+        validation = page.locator(DjinniSelectors.LOGIN_ERROR_SELECTOR)
+        challenge = page.locator(DjinniSelectors.LOGIN_CHALLENGE_SELECTOR)
+        validation_text = await self._visible_text(validation)
+        return (
+            f"url={self._safe_url(page.url)} "
+            f"login_form_visible={await self._is_visible(login_form)} "
+            f"email_input_visible={await self._is_visible(email_input)} "
+            f"password_input_visible={await self._is_visible(password_input)} "
+            f"authenticated_marker_visible={await self._is_visible(authenticated_marker)} "
+            f"challenge_detected={await self._is_visible(challenge)} "
+            f"validation={self._safe_text(validation_text, email, password) if validation_text else 'none'}"
+        )
+
+    @staticmethod
+    async def _is_visible(locator):
+        try:
+            return await locator.count() > 0 and await locator.first.is_visible()
+        except PlaywrightError:
             return False
 
-        login_form_count = await page.locator(DjinniSelectors.LOGIN_FORM_SELECTOR).count()
-        authenticated_marker_count = await page.locator(
-            DjinniSelectors.AUTHENTICATED_MARKER_SELECTOR
-        ).count()
-        return login_form_count == 0 and authenticated_marker_count > 0
+    async def _visible_text(self, locator):
+        if not await self._is_visible(locator):
+            return None
+        try:
+            return await locator.first.text_content()
+        except PlaywrightError:
+            return None
+
+    @staticmethod
+    def _safe_url(value):
+        parsed = urlsplit(value)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+    @staticmethod
+    def _safe_text(value, email, password):
+        text = " ".join((value or "").split())
+        for secret in (email, password):
+            if secret:
+                text = text.replace(secret, "<redacted>")
+        return text[:300]
 
     async def _close_page(self, page):
         if page:
@@ -265,6 +487,16 @@ class DjinniSpider(scrapy.Spider):
                 await page.close()
             except PlaywrightError as error:
                 self.logger.warning("Unable to close Djinni Playwright page cleanly: %s", error)
+
+    async def _close_auth_page(self, auth_page):
+        """Closes only the page created by this login flow, never its context or browser."""
+        if auth_page and not auth_page.is_closed():
+            await self._close_page(auth_page)
+
+    async def _close_initial_page(self, initial_page):
+        """Releases the callback-owned include_page after the auth flow has finished."""
+        if initial_page and not initial_page.is_closed():
+            await self._close_page(initial_page)
 
     def _detail_request(self, listing_item):
         """Requests public vacancy details without Playwright and retains listing context."""
