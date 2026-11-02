@@ -104,6 +104,11 @@ class DjinniSpider(scrapy.Spider):
         """Закриваємо Spider"""
         spider.logger.info("✅Spider closed: %s", spider.name)
 
+    async def start(self):
+        """Expose the existing authentication flow through Scrapy's current start API."""
+        for request in self.start_requests():
+            yield request
+
     def start_requests(self):
         """Reuses a local session or starts one explicit login attempt."""
         self._log_search_configuration()

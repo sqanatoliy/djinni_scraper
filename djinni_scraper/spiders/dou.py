@@ -76,6 +76,11 @@ class DouSpider(scrapy.Spider):
         self.notification_route = self.search_profile.notification_route
         self.start_urls = [self.search_profile.search_url]
 
+    async def start(self):
+        """Expose the typed listing request through Scrapy's current start API."""
+        for request in self.start_requests():
+            yield request
+
     def start_requests(self) -> Iterable[scrapy.Request]:
         self.logger.info(
             "%s profile=%s search_url=%s route=%s",

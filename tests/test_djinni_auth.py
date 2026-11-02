@@ -430,6 +430,14 @@ def test_missing_state_uses_a_managed_initial_page_and_never_requests_direct_log
     assert initial_request.meta["playwright_include_page"] is True
 
 
+def test_async_start_uses_the_managed_initial_page(spider):
+    initial_request = asyncio.run(collect(spider.start()))[0]
+
+    assert initial_request.url == DJINNI_HOME_URL
+    assert initial_request.callback == spider.login
+    assert initial_request.meta["auth_target_url"] == spider.start_urls[0]
+
+
 def test_login_requires_the_initial_playwright_page(spider, caplog):
     response = HtmlResponse(
         url=LISTING_URL,

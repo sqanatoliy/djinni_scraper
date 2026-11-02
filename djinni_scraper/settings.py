@@ -3,6 +3,7 @@ import logging
 import math
 from logging.handlers import RotatingFileHandler
 from decouple import config
+from scrapy.settings.default_settings import EXTENSIONS_BASE as SCRAPY_EXTENSIONS_BASE
 from scrapy.utils.log import configure_logging
 
 
@@ -74,10 +75,14 @@ ROBOTSTXT_OBEY = False
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 # This application persists canonical observations through SQLitePipeline and
-# does not configure Scrapy feed exports. Disable the unused exporter so a
-# Python build without optional ``_lzma`` support can still start a crawler.
-EXTENSIONS = {
-    "scrapy.extensions.feedexport.FeedExporter": None,
+# does not configure Scrapy feed exports. Scrapy 2.17 resolves keys in
+# ``EXTENSIONS`` by importing them, including disabled components. Remove the
+# unused exporter from the base mapping before resolution so builds without
+# optional ``_lzma`` support can start a crawler.
+EXTENSIONS_BASE = {
+    path: priority
+    for path, priority in SCRAPY_EXTENSIONS_BASE.items()
+    if path != "scrapy.extensions.feedexport.FeedExporter"
 }
 
 # === Logging Settings ===

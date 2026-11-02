@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,20 @@ def _detail_requests(outputs):
 
 def _xhr_request(outputs):
     return next(request for request in outputs if isinstance(request, FormRequest))
+
+
+async def _collect_start_requests(spider):
+    return [request async for request in spider.start()]
+
+
+def test_async_start_preserves_the_typed_listing_callback():
+    spider = _spider()
+
+    start_request = asyncio.run(_collect_start_requests(spider))[0]
+
+    assert start_request.url == LISTING_URL
+    assert start_request.callback == spider.parse_listing
+    assert spider.crawler.stats.values["dou/search_requested"] is True
 
 
 def test_start_request_and_listing_cards_are_plain_http_and_scoped_to_the_vacancy_container():
