@@ -141,6 +141,8 @@ def test_workflow_validates_current_sqlite_before_upload_and_preserves_valid_par
     assert "successful_profiles" in decision
     assert "mutated_profiles" in decision
     assert 'upload=false' in decision
+    assert 'if [[ "$RESTORED" == "true" && "$mutated_profiles" -gt 0 ]]; then' in decision
+    assert 'elif [[ "$RESTORED" != "true" && "$successful_profiles" -gt 0 ]]; then' in decision
     assert 'RESTORED: ${{ steps.vacancy-db-restore.outputs.restored }}' in decision
     assert 'DJINNI_PYTHON_SUCCESS: ${{ steps.crawl-python.outputs.success }}' in decision
     assert 'DOU_SUPPORT_REMOTE_0_1_SUCCESS: ${{ steps.crawl-dou-support-remote-0-1.outputs.success }}' in decision

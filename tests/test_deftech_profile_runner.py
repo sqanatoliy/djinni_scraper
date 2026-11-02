@@ -53,6 +53,27 @@ def test_deftech_runner_accepts_a_valid_zero_result_after_completed_xhr_contract
     assert outcome.state_mutated is False
 
 
+def test_deftech_runner_uses_shared_persistence_mutation_stat_not_item_count():
+    no_durable_change = _outcome(_complete_stats())
+    outcome = _outcome(
+        _complete_stats(
+            **{
+                "deftech/listing_job_cards": 0,
+                "deftech/detail_requests": 0,
+                "deftech/detail_completed": 0,
+                "item_scraped_count": 0,
+                "persistence/state_mutated": True,
+            }
+        )
+    )
+
+    assert no_durable_change.items_persisted == 7
+    assert no_durable_change.state_mutated is False
+    assert outcome.success is True
+    assert outcome.items_persisted == 0
+    assert outcome.state_mutated is True
+
+
 @pytest.mark.parametrize(
     ("stats", "reason"),
     (

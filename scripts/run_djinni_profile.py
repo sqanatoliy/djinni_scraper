@@ -28,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
+from djinni_scraper.persistence.sqlite import PERSISTENCE_STATE_MUTATED_STAT
 from djinni_scraper.search_profiles import get_search_profile
 from djinni_scraper.spiders.djinni import DjinniSpider
 
@@ -77,7 +78,7 @@ def outcome_from_stats(profile: str, stats: Mapping[str, object]) -> ProfileOutc
     listing_pages = int(stats.get("djinni/listing_pages", 0))
     listing_job_cards = int(stats.get("djinni/listing_job_cards", 0))
     items_persisted = int(stats.get("item_scraped_count", 0))
-    state_mutated = items_persisted > 0
+    state_mutated = stats.get(PERSISTENCE_STATE_MUTATED_STAT) is True
 
     infrastructure_failure = stats.get("djinni/infrastructure_failure")
     application_failure = stats.get("djinni/application_failure")
@@ -137,10 +138,9 @@ def run_profile(profile: str) -> ProfileOutcome:
         process.start(stop_after_crawl=True)
     except BaseException:  # pragma: no cover - integration boundary
         logging.getLogger(__name__).exception("Djinni profile runner failed before crawl completion")
-        return outcome_from_stats(
-            profile,
-            {"djinni/infrastructure_failure": "runner_exception"},
-        )
+        stats = dict(crawler.stats.get_stats())
+        stats["djinni/infrastructure_failure"] = "runner_exception"
+        return outcome_from_stats(profile, stats)
     return outcome_from_stats(profile, crawler.stats.get_stats())
 
 

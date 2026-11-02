@@ -46,6 +46,28 @@ def test_completed_dou_zero_result_profile_is_successful_after_final_xhr_contrac
     assert outcome.state_mutated is False
 
 
+def test_dou_runner_uses_shared_persistence_mutation_stat_not_item_count():
+    no_durable_change = outcome_from_stats("dou-data-engineer-0-1", _complete_stats())
+    outcome = outcome_from_stats(
+        "dou-data-engineer-0-1",
+        _complete_stats(
+            **{
+                "dou/listing_job_cards": 0,
+                "dou/detail_requests": 0,
+                "dou/detail_completed": 0,
+                "item_scraped_count": 0,
+                "persistence/state_mutated": True,
+            }
+        ),
+    )
+
+    assert no_durable_change.items_persisted == 2
+    assert no_durable_change.state_mutated is False
+    assert outcome.success is True
+    assert outcome.items_persisted == 0
+    assert outcome.state_mutated is True
+
+
 @pytest.mark.parametrize(
     ("stats", "reason"),
     (
@@ -64,7 +86,9 @@ def test_runner_fails_closed_for_source_contract_or_detail_failures(stats, reaso
 
 
 def test_runner_outputs_are_machine_readable_and_include_dou_xhr_terminal_state(tmp_path):
-    outcome = outcome_from_stats("dou-support-remote-0-1", _complete_stats())
+    outcome = outcome_from_stats(
+        "dou-support-remote-0-1", _complete_stats(**{"persistence/state_mutated": True})
+    )
     path = tmp_path / "github-output"
 
     write_github_outputs(str(path), outcome)

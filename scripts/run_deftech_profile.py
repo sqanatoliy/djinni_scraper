@@ -32,9 +32,11 @@ def run_profile(profile: str) -> DouProfileOutcome:
         process.start(stop_after_crawl=True)
     except BaseException:  # pragma: no cover - integration boundary
         logging.getLogger(__name__).exception("DefTech profile runner failed before crawl completion")
+        stats = dict(crawler.stats.get_stats())
+        stats["deftech/infrastructure_failure"] = "runner_exception"
         return outcome_from_stats(
             profile,
-            {"deftech/infrastructure_failure": "runner_exception"},
+            stats,
             stats_prefix="deftech",
             source="deftech",
         )

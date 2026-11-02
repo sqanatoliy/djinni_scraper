@@ -10,7 +10,11 @@ from djinni_scraper.notifications.routing import (
     notification_context_from_spider,
 )
 from djinni_scraper.notifications.telegram import TelegramClient
-from djinni_scraper.persistence.sqlite import NotificationIntent, SQLiteVacancyRepository
+from djinni_scraper.persistence.sqlite import (
+    PERSISTENCE_STATE_MUTATED_STAT,
+    NotificationIntent,
+    SQLiteVacancyRepository,
+)
 
 class SQLitePipeline:
     """Persists canonical observations and dispatches durable notification outbox events."""
@@ -55,16 +59,25 @@ class SQLitePipeline:
             logger=spider.logger,
         )
         spider.logger.info("Canonical SQLite persistence opened at %s", self.db_path)
-        self.dispatcher.dispatch_due()
+        self._publish_mutation_stat(spider)
+        try:
+            self.dispatcher.dispatch_due()
+        finally:
+            self._publish_mutation_stat(spider)
 
     def close_spider(self, spider):
-        if self.dispatcher is not None:
-            self.dispatcher.dispatch_due()
+        try:
+            if self.dispatcher is not None:
+                self.dispatcher.dispatch_due()
+        finally:
             self.dispatcher = None
-        if self.repository is not None:
-            self.repository.close()
-            self.repository = None
-        spider.logger.info("Canonical SQLite persistence closed")
+            try:
+                self._publish_mutation_stat(spider)
+            finally:
+                if self.repository is not None:
+                    self.repository.close()
+                    self.repository = None
+            spider.logger.info("Canonical SQLite persistence closed")
 
     def process_item(self, item, spider):
         adapter = ItemAdapter(item)
@@ -84,6 +97,7 @@ class SQLitePipeline:
                 profile_slug=notification_context.profile_slug,
             ),
         )
+        self._publish_mutation_stat(spider)
         spider.logger.info(
             "canonical-vacancy-persisted url=%s status=%s discovery_added=%s",
             vacancy.url,
@@ -98,6 +112,15 @@ class SQLitePipeline:
                 notification_context.profile_slug,
             )
         return item
+
+    def _publish_mutation_stat(self, spider) -> None:
+        """Expose committed SQLite mutation state once for all source families."""
+        if self.repository is None or not self.repository.state_mutated:
+            return
+        crawler = getattr(spider, "crawler", None)
+        stats = getattr(crawler, "stats", None)
+        if stats is not None:
+            stats.set_value(PERSISTENCE_STATE_MUTATED_STAT, True)
 
     def _require_repository(self) -> SQLiteVacancyRepository:
         if self.repository is None:

@@ -17,6 +17,7 @@ from djinni_scraper.domain.vacancy import Company, Compensation, LanguageRequire
 
 
 SCHEMA_VERSION = 5
+PERSISTENCE_STATE_MUTATED_STAT = "persistence/state_mutated"
 _V1_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
 _V3_SCHEMA_VERSION = 3
@@ -210,17 +211,25 @@ class SQLiteVacancyRepository:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self.connection: sqlite3.Connection | None = None
+        self._state_mutated = False
+
+    @property
+    def state_mutated(self) -> bool:
+        """Whether this opened repository lifecycle committed durable SQLite changes."""
+        return self._state_mutated
 
     def open(self) -> None:
         """Opens the database, enables foreign keys, and initializes or migrates schema."""
         if self.connection is not None:
             return
+        self._state_mutated = False
         if self.db_path != ":memory:":
             Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.db_path)
         self.connection.row_factory = sqlite3.Row
         try:
-            initialize_schema(self.connection)
+            if initialize_schema(self.connection):
+                self._state_mutated = True
         except Exception:
             self.connection.close()
             self.connection = None
@@ -254,6 +263,7 @@ class SQLiteVacancyRepository:
         )
         record = vacancy_to_record(vacancy)
         publication_day = normalize_publication_day(vacancy.published_at)
+        changes_before = connection.total_changes
 
         try:
             connection.execute("BEGIN")
@@ -356,6 +366,8 @@ class SQLiteVacancyRepository:
         except Exception:
             connection.rollback()
             raise
+
+        self._record_committed_row_changes(changes_before)
 
         return PersistenceResult(
             status=status,
@@ -594,9 +606,9 @@ class SQLiteVacancyRepository:
                 """
                 UPDATE vacancy_publications
                 SET last_observed_at = ?
-                WHERE id = ?
+                WHERE id = ? AND last_observed_at IS NOT ?
                 """,
-                (observed_at, existing["id"]),
+                (observed_at, existing["id"], observed_at),
             )
             return existing["id"], False, False
 
@@ -728,7 +740,12 @@ class SQLiteVacancyRepository:
     @staticmethod
     def _touch_last_seen(connection: sqlite3.Connection, vacancy_id: int, observed_at: str) -> None:
         connection.execute(
-            "UPDATE vacancies SET last_seen_at = ? WHERE id = ?", (observed_at, vacancy_id)
+            """
+            UPDATE vacancies
+            SET last_seen_at = ?
+            WHERE id = ? AND last_seen_at IS NOT ?
+            """,
+            (observed_at, vacancy_id, observed_at),
         )
 
     @staticmethod
@@ -781,9 +798,9 @@ class SQLiteVacancyRepository:
                     """
                     UPDATE vacancy_discoveries
                     SET last_discovered_at = ?
-                    WHERE vacancy_id = ? AND profile_slug = ?
+                    WHERE vacancy_id = ? AND profile_slug = ? AND last_discovered_at IS NOT ?
                     """,
-                    (observed_at, vacancy_id, profile_slug),
+                    (observed_at, vacancy_id, profile_slug, observed_at),
                 )
         return discovery_added
 
@@ -831,6 +848,7 @@ class SQLiteVacancyRepository:
         last_error: str | None,
     ) -> None:
         connection = self._require_connection()
+        changes_before = connection.total_changes
         try:
             connection.execute("BEGIN")
             cursor = connection.execute(
@@ -857,6 +875,18 @@ class SQLiteVacancyRepository:
         except Exception:
             connection.rollback()
             raise
+        self._record_committed_row_changes(changes_before)
+
+    def _record_committed_row_changes(self, changes_before: int) -> None:
+        """Latches mutation only after a transaction that committed row changes.
+
+        ``sqlite3.Connection.total_changes`` is scoped to this repository's
+        single connection.  A baseline is taken for each transaction, and the
+        value is considered only after ``commit`` succeeds; a rolled-back
+        transaction therefore cannot flip the lifecycle signal.
+        """
+        if self._require_connection().total_changes > changes_before:
+            self._state_mutated = True
 
     def _vacancy_from_row(self, row: Mapping[str, Any]) -> Vacancy:
         return row_to_vacancy(
@@ -870,35 +900,40 @@ class SQLiteVacancyRepository:
         return self.connection
 
 
-def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Creates schema v5 or migrates canonical v1 through v4 databases in place."""
+def initialize_schema(connection: sqlite3.Connection) -> bool:
+    """Creates or migrates schema and reports whether durable schema state changed."""
     connection.execute("PRAGMA foreign_keys = ON")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     vacancy_columns = _table_columns(connection, VACANCIES_TABLE)
+    schema_mutated = False
 
     if current_version == 0 and not vacancy_columns:
         _create_new_v5_schema(connection)
-        return
+        return True
     if current_version in (0, _V1_SCHEMA_VERSION) and _V1_CANONICAL_COLUMNS.issubset(
         vacancy_columns
     ):
         _migrate_v1_to_v2(connection)
         current_version = _V2_SCHEMA_VERSION
+        schema_mutated = True
     if current_version == _V2_SCHEMA_VERSION:
         _validate_v2_schema(connection)
         _migrate_v2_to_v3(connection)
         current_version = _V3_SCHEMA_VERSION
+        schema_mutated = True
     if current_version == _V3_SCHEMA_VERSION:
         _validate_v3_schema(connection)
         _migrate_v3_to_v4(connection)
         current_version = _V4_SCHEMA_VERSION
+        schema_mutated = True
     if current_version == _V4_SCHEMA_VERSION:
         _validate_v4_schema(connection)
         _migrate_v4_to_v5(connection)
         current_version = SCHEMA_VERSION
+        schema_mutated = True
     if current_version == SCHEMA_VERSION:
         _validate_v5_schema(connection)
-        return
+        return schema_mutated
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported SQLite schema version {current_version}; latest supported version is {SCHEMA_VERSION}"

@@ -21,6 +21,7 @@ from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
 from djinni_scraper.dou_profiles import list_dou_search_profiles
+from djinni_scraper.persistence.sqlite import PERSISTENCE_STATE_MUTATED_STAT
 from djinni_scraper.spiders.dou import DouSpider
 
 
@@ -119,7 +120,7 @@ def outcome_from_stats(
         items_persisted=items_persisted,
         detail_requests=detail_requests,
         detail_completed=detail_completed,
-        state_mutated=items_persisted > 0,
+        state_mutated=stats.get(PERSISTENCE_STATE_MUTATED_STAT) is True,
     )
 
 
@@ -132,7 +133,9 @@ def run_profile(profile: str) -> DouProfileOutcome:
         process.start(stop_after_crawl=True)
     except BaseException:  # pragma: no cover - integration boundary
         logging.getLogger(__name__).exception("DOU profile runner failed before crawl completion")
-        return outcome_from_stats(profile, {"dou/infrastructure_failure": "runner_exception"})
+        stats = dict(crawler.stats.get_stats())
+        stats["dou/infrastructure_failure"] = "runner_exception"
+        return outcome_from_stats(profile, stats)
     return outcome_from_stats(profile, crawler.stats.get_stats())
 
 

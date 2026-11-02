@@ -268,6 +268,7 @@ def test_v1_database_migrates_preserving_rows_backfills_discovery_hash_and_times
     restored = repository.get_vacancy_by_identity_key(vacancy_identity_key(legacy))
 
     assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert repository.state_mutated is True
     assert _vacancy_count(repository) == 1
     assert restored == replace(legacy, discovery_profiles=("data_engineer", "python"))
     assert row["content_hash"] == vacancy_content_hash(legacy)
@@ -285,6 +286,7 @@ def test_v1_database_migrates_preserving_rows_backfills_discovery_hash_and_times
 
     repository.close()
     repository.open()
+    assert repository.state_mutated is False
     assert repository.connection.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _vacancy_count(repository) == 1
     repository.close()
@@ -326,6 +328,7 @@ def test_v4_database_migrates_to_v5_with_baseline_version_without_new_notificati
     )
 
     assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert repository.state_mutated is True
     assert _vacancy_count(repository) == 1
     assert connection.execute("SELECT COUNT(*) FROM vacancy_publications").fetchone()[0] == 2
     assert connection.execute("SELECT COUNT(*) FROM vacancy_discoveries").fetchone()[0] == 1
@@ -342,6 +345,7 @@ def test_v4_database_migrates_to_v5_with_baseline_version_without_new_notificati
 
     repository.close()
     repository.open()
+    assert repository.state_mutated is False
     assert _version_count(repository, 1) == 1
     assert repository.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 2
 

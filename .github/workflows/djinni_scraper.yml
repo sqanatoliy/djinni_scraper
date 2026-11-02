@@ -314,7 +314,9 @@ jobs:
         done
 
         upload=false
-        if [[ "$successful_profiles" -gt 0 && ( "$RESTORED" != "true" || "$mutated_profiles" -gt 0 ) ]]; then
+        if [[ "$RESTORED" == "true" && "$mutated_profiles" -gt 0 ]]; then
+          upload=true
+        elif [[ "$RESTORED" != "true" && "$successful_profiles" -gt 0 ]]; then
           upload=true
         fi
 
