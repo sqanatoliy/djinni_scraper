@@ -1,0 +1,13 @@
+name = "djinni-scraper-scheduler"
+main = "src/index.js"
+compatibility_date = "2026-11-02"
+workers_dev = false
+
+[triggers]
+crons = ["37 * * * *"]
+
+[vars]
+GITHUB_OWNER = "sqanatoliy"
+GITHUB_REPO = "djinni_scraper"
+GITHUB_WORKFLOW_ID = "145842968"
+GITHUB_REF = "main"

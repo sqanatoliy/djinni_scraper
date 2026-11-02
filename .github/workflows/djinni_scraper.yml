@@ -1,8 +1,6 @@
 name: Run Job Scrapers Hourly
 
 on:
-  schedule:
-    - cron: '37 * * * *'  # Запуск кожну годину
   workflow_dispatch:  # Можливість ручного запуску
 
 concurrency:

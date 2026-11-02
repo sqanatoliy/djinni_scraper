@@ -1,0 +1,8 @@
+{
+  "name": "djinni-scraper-cloudflare-scheduler",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
