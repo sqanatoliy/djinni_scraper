@@ -173,6 +173,14 @@ def test_workflow_fails_closed_on_profile_failures_and_uses_current_actions_vers
     assert '"deftech-data-engineer:$DEFTECH_DATA_ENGINEER_SUCCESS"' in enforce
 
 
+def test_workflow_pins_ubuntu_24_04_for_playwright_browser_compatibility():
+    workflow = _workflow()
+
+    assert "runs-on: ubuntu-24.04" in workflow
+    assert "runs-on: ubuntu-latest" not in workflow
+    assert "playwright install chromium" in workflow
+
+
 def test_workflow_keeps_single_writer_concurrency_and_never_commits_sqlite_state_to_git():
     workflow = _workflow()
 

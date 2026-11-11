@@ -11,7 +11,7 @@ concurrency:
 jobs:
   run_scraper:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       R2_DB_OBJECT_KEY: production/vacancies.db
 
